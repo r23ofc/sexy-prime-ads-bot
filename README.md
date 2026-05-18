@@ -1,0 +1,224 @@
+# Sexy Prime Ads Bot
+
+Bot de anúncios para a Agência Sexy Prime com painel pelo Telegram, mídia, botão URL, agendamento, fixação, exclusão da última postagem, destinos aprovados e modo Render/Webhook.
+
+## Funções
+
+- Painel exclusivo para dono/admin
+- Usuário comum recebe aviso de uso exclusivo
+- Criar anúncio com foto ou vídeo
+- Descrição + botão URL
+- Prévia antes de postar
+- Postar agora
+- Agendar por horário
+- Fixar anúncio automaticamente
+- Apagar postagem anterior do bot
+- Aprovar/rejeitar grupos e canais
+- Logs de erro
+- Backup do banco pelo Telegram
+- Modo local com polling
+- Modo Render com webhook
+- Endpoint de ping para cron de 10 em 10 minutos
+
+---
+
+## Arquivos
+
+```txt
+bot.py
+ping.py
+requirements.txt
+.env.example
+render.yaml
+rodar_windows.bat
+sexy-prime-ads.service.example
+data/
+logs/
+```
+
+---
+
+## Rodar localmente no Windows
+
+### 1. Instale as dependências
+
+```bat
+cd C:\xampp\htdocs\sexy_prime_ads_bot
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Crie o arquivo `.env`
+
+Copie `.env.example` e renomeie para `.env`.
+
+Para rodar localmente, use:
+
+```env
+RUN_MODE=polling
+BOT_TOKEN=SEU_TOKEN
+OWNER_ID=SEU_ID
+AGENCY_NAME=Sexy Prime
+SUPPORT_URL=https://t.me/SXP_suporte
+TIMEZONE=America/Sao_Paulo
+DB_PATH=data/sexy_prime_ads.db
+```
+
+### 3. Rode
+
+```bat
+python bot.py
+```
+
+---
+
+## Rodar no Render
+
+### 1. Envie o projeto para o GitHub
+
+Suba estes arquivos para um repositório GitHub.
+
+### 2. Crie um Web Service no Render
+
+No Render:
+
+```txt
+New > Web Service > selecione o repositório
+```
+
+Configuração:
+
+```txt
+Runtime: Python
+Build Command: pip install -r requirements.txt
+Start Command: python bot.py
+Plan: Free
+```
+
+### 3. Configure as variáveis no Render
+
+Em **Environment**, adicione:
+
+```env
+RUN_MODE=webhook
+BOT_TOKEN=TOKEN_DO_BOT
+OWNER_ID=SEU_ID_NUMERICO
+AGENCY_NAME=Sexy Prime
+SUPPORT_URL=https://t.me/SXP_suporte
+TIMEZONE=America/Sao_Paulo
+DB_PATH=data/sexy_prime_ads.db
+WEBHOOK_URL=https://SEU-SERVICO.onrender.com
+WEBHOOK_PATH=/webhook/sexy-prime-ads-segredo
+```
+
+Troque `SEU-SERVICO` pelo nome real do seu serviço no Render.
+
+Exemplo:
+
+```env
+WEBHOOK_URL=https://sexy-prime-ads-bot.onrender.com
+WEBHOOK_PATH=/webhook/sp-ads-928371-secreto
+```
+
+A URL final do webhook/ping será:
+
+```txt
+https://sexy-prime-ads-bot.onrender.com/webhook/sp-ads-928371-secreto
+```
+
+---
+
+## Cron Job de 10 em 10 minutos
+
+O bot aceita `GET` no próprio webhook. Então o cron pode acessar esta URL de 10 em 10 minutos:
+
+```txt
+https://SEU-SERVICO.onrender.com/webhook/SEU-CAMINHO-SECRETO
+```
+
+Também funcionam:
+
+```txt
+https://SEU-SERVICO.onrender.com/
+https://SEU-SERVICO.onrender.com/health
+https://SEU-SERVICO.onrender.com/ping
+```
+
+### Opção A: Cron externo grátis
+
+Use um serviço como `cron-job.org` ou UptimeRobot.
+
+Configuração:
+
+```txt
+URL: https://SEU-SERVICO.onrender.com/webhook/SEU-CAMINHO-SECRETO
+Método: GET
+Intervalo: 10 minutos
+```
+
+### Opção B: Cron Job dentro do Render
+
+O arquivo `ping.py` foi criado para isso.
+
+Crie um novo serviço no Render:
+
+```txt
+New > Cron Job
+```
+
+Configuração:
+
+```txt
+Runtime: Python
+Build Command: pip install -r requirements.txt
+Command: python ping.py
+Schedule: */10 * * * *
+```
+
+Variável:
+
+```env
+PING_URL=https://SEU-SERVICO.onrender.com/webhook/SEU-CAMINHO-SECRETO
+```
+
+Atenção: Cron Job do Render pode ter cobrança mínima mensal. Para grátis, prefira cron externo.
+
+---
+
+## Comandos do bot
+
+```txt
+/start - abre painel
+/panel - abre painel admin
+/id - mostra seu ID
+/help - ajuda
+/addadmin ID - adiciona admin extra
+/removeadmin ID - remove admin extra
+/backup - baixa backup do banco
+/cancel - cancela operação atual
+```
+
+---
+
+## Permissões necessárias
+
+Para postar em grupo/canal, coloque o bot como admin com permissões:
+
+- Enviar mensagens
+- Apagar mensagens
+- Fixar mensagens
+- Postar mensagens em canal
+
+---
+
+## Aviso importante sobre SQLite no Render Free
+
+O banco padrão é SQLite em `data/sexy_prime_ads.db`.
+
+No Render Free, o sistema de arquivos é temporário. Se o serviço reiniciar, redeployar ou dormir, o banco pode ser perdido. Para teste funciona, mas para produção use:
+
+- Oracle Cloud Always Free com SQLite/arquivo persistente; ou
+- Render pago com persistent disk; ou
+- Postgres externo.
+

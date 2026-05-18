@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: sexy-prime-ads-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: RUN_MODE
+        value: webhook
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: AGENCY_NAME
+        value: Sexy Prime
+      - key: SUPPORT_URL
+        value: https://t.me/SXP_suporte
+      - key: TIMEZONE
+        value: America/Sao_Paulo
+      - key: DB_PATH
+        value: data/sexy_prime_ads.db
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_PATH
+        sync: false
+
+  # Opcional: Cron Job do próprio Render para pingar o bot.
+  # Atenção: segundo a documentação do Render, Cron Jobs têm cobrança mínima mensal.
+  - type: cron
+    name: sexy-prime-ads-ping
+    runtime: python
+    schedule: "*/10 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python ping.py
+    envVars:
+      - key: PING_URL
+        sync: false

@@ -1,0 +1,13 @@
+[Unit]
+Description=Sexy Prime Ads Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/home/ubuntu/sexy_prime_ads_bot
+ExecStart=/home/ubuntu/sexy_prime_ads_bot/.venv/bin/python /home/ubuntu/sexy_prime_ads_bot/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
