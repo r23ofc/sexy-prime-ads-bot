@@ -11,6 +11,7 @@ Bot de anúncios para a Agência Sexy Prime com painel pelo Telegram, mídia, bo
 - Prévia antes de postar
 - Postar agora
 - Agendar por horário
+- Postagem automática por intervalo: 1h, 2h, 3h, 4h, 6h ou 12h
 - Fixar anúncio automaticamente
 - Apagar postagem anterior do bot
 - Aprovar/rejeitar grupos e canais
@@ -183,6 +184,26 @@ PING_URL=https://SEU-SERVICO.onrender.com/webhook/SEU-CAMINHO-SECRETO
 ```
 
 Atenção: Cron Job do Render pode ter cobrança mínima mensal. Para grátis, prefira cron externo.
+
+
+---
+
+## Postagem automática de 3 em 3 horas
+
+Depois de criar um anúncio:
+
+```txt
+/start > 📋 Meus anúncios > escolha o anúncio > 🔁 Automático > 3 em 3 horas
+```
+
+O bot vai postar esse anúncio automaticamente em todos os destinos aprovados ativos a cada 3 horas.
+
+Importante:
+
+- A primeira postagem automática acontece depois do intervalo escolhido.
+- Para postar imediatamente, use `🚀 Postar agora`.
+- Se ativar outro intervalo para o mesmo anúncio, o intervalo antigo daquele anúncio é parado automaticamente.
+- Para parar, use `🔁 Postagem automática` no painel e clique em `⛔ Parar automático`.
 
 ---
 

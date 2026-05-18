@@ -191,6 +191,21 @@ class Database:
 
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS interval_schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ad_id INTEGER NOT NULL,
+                    interval_hours INTEGER NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    last_run_at TEXT,
+                    FOREIGN KEY(ad_id) REFERENCES ads(id)
+                )
+                """
+            )
+
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS post_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ad_id INTEGER,
@@ -451,6 +466,78 @@ class Database:
                 (int(active),),
             ).fetchone()["c"]
 
+    # ---------- Interval schedules ----------
+    def create_interval_schedule(self, ad_id: int, interval_hours: int) -> int:
+        interval_hours = int(interval_hours)
+        if interval_hours < 1 or interval_hours > 24:
+            raise ValueError("Intervalo inválido. Use de 1 a 24 horas.")
+        with self.conn() as con:
+            cur = con.execute(
+                """
+                INSERT INTO interval_schedules (
+                    ad_id, interval_hours, active, created_at, updated_at, last_run_at
+                )
+                VALUES (?, ?, 1, ?, ?, NULL)
+                """,
+                (ad_id, interval_hours, now_iso(), now_iso()),
+            )
+            con.commit()
+            return int(cur.lastrowid)
+
+    def get_interval_schedule(self, interval_id: int):
+        with self.conn() as con:
+            return con.execute("SELECT * FROM interval_schedules WHERE id=?", (interval_id,)).fetchone()
+
+    def list_interval_schedules(self, active_only: bool = False):
+        where = "WHERE i.active=1" if active_only else ""
+        with self.conn() as con:
+            return con.execute(
+                f"""
+                SELECT i.*, a.title AS ad_title
+                FROM interval_schedules i
+                LEFT JOIN ads a ON a.id=i.ad_id
+                {where}
+                ORDER BY i.id DESC
+                """
+            ).fetchall()
+
+    def set_interval_schedule_active(self, interval_id: int, active: bool):
+        with self.conn() as con:
+            con.execute(
+                "UPDATE interval_schedules SET active=?, updated_at=? WHERE id=?",
+                (int(active), now_iso(), interval_id),
+            )
+            con.commit()
+
+    def disable_active_intervals_for_ad(self, ad_id: int) -> list[int]:
+        with self.conn() as con:
+            rows = con.execute(
+                "SELECT id FROM interval_schedules WHERE ad_id=? AND active=1",
+                (ad_id,),
+            ).fetchall()
+            ids = [int(r["id"]) for r in rows]
+            con.execute(
+                "UPDATE interval_schedules SET active=0, updated_at=? WHERE ad_id=? AND active=1",
+                (now_iso(), ad_id),
+            )
+            con.commit()
+            return ids
+
+    def mark_interval_ran(self, interval_id: int):
+        with self.conn() as con:
+            con.execute(
+                "UPDATE interval_schedules SET last_run_at=?, updated_at=? WHERE id=?",
+                (now_iso(), now_iso(), interval_id),
+            )
+            con.commit()
+
+    def count_interval_schedules(self, active=True):
+        with self.conn() as con:
+            return con.execute(
+                "SELECT COUNT(*) AS c FROM interval_schedules WHERE active=?",
+                (int(active),),
+            ).fetchone()["c"]
+
     # ---------- Logs ----------
     def add_log(self, ad_id, chat_id, message_id, status, error_message=""):
         with self.conn() as con:
@@ -537,6 +624,7 @@ def main_menu():
                 InlineKeyboardButton("📋 Meus anúncios", callback_data="ad:list"),
                 InlineKeyboardButton("⏰ Agendamentos", callback_data="sched:list"),
             ],
+            [InlineKeyboardButton("🔁 Postagem automática", callback_data="interval:list")],
             [
                 InlineKeyboardButton("📍 Destinos pendentes", callback_data="tg:pending"),
                 InlineKeyboardButton("✅ Destinos aprovados", callback_data="tg:approved"),
@@ -574,10 +662,13 @@ def ad_keyboard(ad_id: int):
             ],
             [
                 InlineKeyboardButton("⏰ Agendar", callback_data=f"ad:schedule:{ad_id}"),
-                InlineKeyboardButton("✏️ Editar", callback_data=f"ad:edit:{ad_id}"),
+                InlineKeyboardButton("🔁 Automático", callback_data=f"ad:interval:{ad_id}"),
             ],
             [
+                InlineKeyboardButton("✏️ Editar", callback_data=f"ad:edit:{ad_id}"),
                 InlineKeyboardButton("🗑 Remover", callback_data=f"ad:delete:{ad_id}"),
+            ],
+            [
                 InlineKeyboardButton("⬅️ Lista", callback_data="ad:list"),
             ],
         ]
@@ -799,9 +890,47 @@ def remove_schedule_job(application: Application, schedule_id: int):
         job.schedule_removal()
 
 
+def schedule_interval_job(application: Application, interval_row):
+    if not application.job_queue:
+        logger.error('JobQueue indisponível. Instale: pip install "python-telegram-bot[job-queue]"')
+        return
+
+    name = f"interval_{interval_row['id']}"
+
+    for job in application.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+    interval_hours = int(interval_row["interval_hours"])
+    interval_seconds = interval_hours * 60 * 60
+
+    application.job_queue.run_repeating(
+        interval_post_job,
+        interval=interval_seconds,
+        first=interval_seconds,
+        data={"interval_id": int(interval_row["id"])},
+        name=name,
+    )
+
+    logger.info(
+        "Postagem automática carregada: %s a cada %sh",
+        name,
+        interval_hours,
+    )
+
+
+def remove_interval_job(application: Application, interval_id: int):
+    if not application.job_queue:
+        return
+    name = f"interval_{interval_id}"
+    for job in application.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+
 def load_schedules(application: Application):
     for sched in db.list_schedules(active_only=True):
         schedule_job(application, sched)
+    for interval in db.list_interval_schedules(active_only=True):
+        schedule_interval_job(application, interval)
 
 
 async def scheduled_post_job(context: ContextTypes.DEFAULT_TYPE):
@@ -824,6 +953,42 @@ async def scheduled_post_job(context: ContextTypes.DEFAULT_TYPE):
             text=(
                 f"⏰ Agendamento executado\n\n"
                 f"Anúncio: #{ad['id']} - {ad['title']}\n"
+                f"Destinos: {result['total']}\n"
+                f"Enviados: {result['success']}\n"
+                f"Falhas: {result['error']}"
+            ),
+        )
+    except TelegramError:
+        pass
+
+
+async def interval_post_job(context: ContextTypes.DEFAULT_TYPE):
+    interval_id = int(context.job.data["interval_id"])
+    interval = db.get_interval_schedule(interval_id)
+    if not interval or not interval["active"]:
+        return
+
+    ad = db.get_ad(int(interval["ad_id"]))
+    if not ad or not ad["active"]:
+        logger.warning("Postagem automática %s ignorada: anúncio ausente ou desativado.", interval_id)
+        return
+
+    logger.info(
+        "Executando postagem automática #%s do anúncio #%s a cada %sh",
+        interval_id,
+        ad["id"],
+        interval["interval_hours"],
+    )
+    result = await post_ad_to_all(context.bot, ad)
+    db.mark_interval_ran(interval_id)
+
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                f"🔁 Postagem automática executada\n\n"
+                f"Anúncio: #{ad['id']} - {ad['title']}\n"
+                f"Intervalo: a cada {interval['interval_hours']}h\n"
                 f"Destinos: {result['total']}\n"
                 f"Enviados: {result['success']}\n"
                 f"Falhas: {result['error']}"
@@ -1342,6 +1507,67 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("ad:interval:"):
+        ad_id = int(data.split(":")[-1])
+        ad = db.get_ad(ad_id)
+        if not ad:
+            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
+            return
+
+        await safe_edit(
+            query,
+            f"🔁 Postagem automática do anúncio #{ad_id}\n\n"
+            "Escolha de quanto em quanto tempo o bot deve postar este anúncio.\n\n"
+            "Importante: ao ativar, a primeira postagem automática acontece depois do intervalo escolhido. "
+            "Se quiser postar agora, use o botão 🚀 Postar agora.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("1 em 1 hora", callback_data=f"interval:create:{ad_id}:1"),
+                        InlineKeyboardButton("2 em 2 horas", callback_data=f"interval:create:{ad_id}:2"),
+                    ],
+                    [
+                        InlineKeyboardButton("3 em 3 horas", callback_data=f"interval:create:{ad_id}:3"),
+                        InlineKeyboardButton("4 em 4 horas", callback_data=f"interval:create:{ad_id}:4"),
+                    ],
+                    [
+                        InlineKeyboardButton("6 em 6 horas", callback_data=f"interval:create:{ad_id}:6"),
+                        InlineKeyboardButton("12 em 12 horas", callback_data=f"interval:create:{ad_id}:12"),
+                    ],
+                    [InlineKeyboardButton("⬅️ Voltar", callback_data=f"ad:view:{ad_id}")],
+                ]
+            ),
+        )
+        return
+
+    if data.startswith("interval:create:"):
+        parts = data.split(":")
+        ad_id = int(parts[2])
+        interval_hours = int(parts[3])
+        ad = db.get_ad(ad_id)
+        if not ad:
+            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
+            return
+
+        old_interval_ids = db.disable_active_intervals_for_ad(ad_id)
+        for old_interval_id in old_interval_ids:
+            remove_interval_job(context.application, old_interval_id)
+
+        interval_id = db.create_interval_schedule(ad_id, interval_hours)
+        interval = db.get_interval_schedule(interval_id)
+        schedule_interval_job(context.application, interval)
+
+        await safe_edit(
+            query,
+            f"✅ Postagem automática ativada.\n\n"
+            f"Anúncio: #{ad_id} - {ad['title']}\n"
+            f"Intervalo: a cada {interval_hours} hora(s)\n\n"
+            "O bot vai postar nos destinos aprovados ativos. "
+            "A primeira postagem automática acontece depois desse intervalo.",
+            reply_markup=ad_keyboard(ad_id),
+        )
+        return
+
     if data.startswith("ad:edit:"):
         ad_id = int(data.split(":")[-1])
         ad = db.get_ad(ad_id)
@@ -1521,6 +1747,41 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, f"✅ Agendamento #{schedule_id} desativado.", reply_markup=back_home())
         return
 
+    # ---------- intervalos automáticos ----------
+    if data == "interval:list":
+        intervals = db.list_interval_schedules(active_only=False)
+        if not intervals:
+            await safe_edit(
+                query,
+                "🔁 Nenhuma postagem automática criada ainda.\n\n"
+                "Para ativar: Meus anúncios > escolha o anúncio > 🔁 Automático.",
+                reply_markup=back_home(),
+            )
+            return
+
+        text = "🔁 Postagens automáticas:\n\n"
+        rows = []
+        for i in intervals:
+            status = "✅" if i["active"] else "❌"
+            last_run = i["last_run_at"] or "ainda não executou"
+            text += (
+                f"{status} #{i['id']} - a cada {i['interval_hours']}h\n"
+                f"Anúncio: #{i['ad_id']} - {i['ad_title'] or 'removido'}\n"
+                f"Última execução: {last_run}\n\n"
+            )
+            if i["active"]:
+                rows.append([InlineKeyboardButton(f"⛔ Parar automático #{i['id']}", callback_data=f"interval:disable:{i['id']}")])
+        rows.append([InlineKeyboardButton("⬅️ Voltar", callback_data="menu:home")])
+        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("interval:disable:"):
+        interval_id = int(data.split(":")[-1])
+        db.set_interval_schedule_active(interval_id, False)
+        remove_interval_job(context.application, interval_id)
+        await safe_edit(query, f"✅ Postagem automática #{interval_id} parada.", reply_markup=back_home())
+        return
+
     # ---------- stats / settings ----------
     if data == "stats":
         st = db.stats_today()
@@ -1529,7 +1790,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Anúncios cadastrados: {db.count_ads()}\n"
             f"Destinos pendentes: {db.count_targets(approved=False, active=True)}\n"
             f"Destinos aprovados ativos: {db.count_targets(approved=True, active=True)}\n"
-            f"Agendamentos ativos: {db.count_schedules(active=True)}\n\n"
+            f"Agendamentos ativos: {db.count_schedules(active=True)}\n"
+            f"Postagens automáticas ativas: {db.count_interval_schedules(active=True)}\n\n"
             f"Postagens hoje: {st['total']}\n"
             f"Enviadas hoje: {st['success']}\n"
             f"Falhas hoje: {st['error']}\n"
