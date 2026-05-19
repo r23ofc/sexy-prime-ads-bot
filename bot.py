@@ -45,6 +45,20 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/SXP_suporte").strip()
 TIMEZONE_NAME = os.getenv("TIMEZONE", "America/Sao_Paulo").strip()
 DB_PATH = os.getenv("DB_PATH", "data/sexy_prime_ads.db").strip()
 
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "sim", "on", "ativo"}
+
+
+# Notificações privadas para o dono.
+# Por padrão, a postagem automática por intervalo NÃO avisa no PV a cada execução,
+# para não ficar enchendo o chat do dono.
+NOTIFY_INTERVAL_POSTS = env_bool("NOTIFY_INTERVAL_POSTS", False)
+NOTIFY_SCHEDULED_POSTS = env_bool("NOTIFY_SCHEDULED_POSTS", True)
+
 # Render/Webhook
 # RUN_MODE=polling para rodar localmente. RUN_MODE=webhook para Render.
 RUN_MODE = os.getenv("RUN_MODE", "polling").strip().lower()
@@ -947,19 +961,20 @@ async def scheduled_post_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Executando agendamento #%s do anúncio #%s", schedule_id, ad["id"])
     result = await post_ad_to_all(context.bot, ad)
 
-    try:
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                f"⏰ Agendamento executado\n\n"
-                f"Anúncio: #{ad['id']} - {ad['title']}\n"
-                f"Destinos: {result['total']}\n"
-                f"Enviados: {result['success']}\n"
-                f"Falhas: {result['error']}"
-            ),
-        )
-    except TelegramError:
-        pass
+    if NOTIFY_SCHEDULED_POSTS:
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"⏰ Agendamento executado\n\n"
+                    f"Anúncio: #{ad['id']} - {ad['title']}\n"
+                    f"Destinos: {result['total']}\n"
+                    f"Enviados: {result['success']}\n"
+                    f"Falhas: {result['error']}"
+                ),
+            )
+        except TelegramError:
+            pass
 
 
 async def interval_post_job(context: ContextTypes.DEFAULT_TYPE):
@@ -982,20 +997,21 @@ async def interval_post_job(context: ContextTypes.DEFAULT_TYPE):
     result = await post_ad_to_all(context.bot, ad)
     db.mark_interval_ran(interval_id)
 
-    try:
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                f"🔁 Postagem automática executada\n\n"
-                f"Anúncio: #{ad['id']} - {ad['title']}\n"
-                f"Intervalo: a cada {interval['interval_hours']}h\n"
-                f"Destinos: {result['total']}\n"
-                f"Enviados: {result['success']}\n"
-                f"Falhas: {result['error']}"
-            ),
-        )
-    except TelegramError:
-        pass
+    if NOTIFY_INTERVAL_POSTS:
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"🔁 Postagem automática executada\n\n"
+                    f"Anúncio: #{ad['id']} - {ad['title']}\n"
+                    f"Intervalo: a cada {interval['interval_hours']}h\n"
+                    f"Destinos: {result['total']}\n"
+                    f"Enviados: {result['success']}\n"
+                    f"Falhas: {result['error']}"
+                ),
+            )
+        except TelegramError:
+            pass
 
 
 async def post_init(application: Application):

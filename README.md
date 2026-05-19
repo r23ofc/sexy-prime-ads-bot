@@ -243,3 +243,17 @@ No Render Free, o sistema de arquivos é temporário. Se o serviço reiniciar, r
 - Render pago com persistent disk; ou
 - Postgres externo.
 
+
+
+## Notificações de postagem automática
+
+Por padrão, a postagem automática por intervalo não envia mensagem no PV do dono a cada execução.
+
+Para mudar isso no Render, use:
+
+```env
+NOTIFY_INTERVAL_POSTS=false
+NOTIFY_SCHEDULED_POSTS=true
+```
+
+Se quiser receber relatório no PV toda vez que a postagem automática rodar, altere `NOTIFY_INTERVAL_POSTS` para `true`.
