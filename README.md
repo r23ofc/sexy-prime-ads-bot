@@ -1,12 +1,13 @@
 # Sexy Prime Ads Bot
 
-Bot de anúncios para a Agência Sexy Prime com painel pelo Telegram, mídia, botão URL, agendamento, fixação, exclusão da última postagem, destinos aprovados e modo Render/Webhook.
+Bot de anúncios para a Agência Sexy Prime com painel pelo Telegram, mídia ou anúncio somente texto, botão URL, texto citado, links embutidos, agendamento, fixação, exclusão da última postagem, destinos aprovados e modo Render/Webhook.
 
 ## Funções
 
 - Painel exclusivo para dono/admin
 - Usuário comum recebe aviso de uso exclusivo
-- Criar anúncio com foto ou vídeo
+- Criar anúncio com foto, vídeo ou somente texto
+- Aceita textos citados/blockquote do Telegram, links embutidos e mensagens de texto com redirecionamento
 - Descrição + botão URL
 - Prévia antes de postar
 - Postar agora
@@ -186,6 +187,48 @@ PING_URL=https://SEU-SERVICO.onrender.com/webhook/SEU-CAMINHO-SECRETO
 Atenção: Cron Job do Render pode ter cobrança mínima mensal. Para grátis, prefira cron externo.
 
 
+
+---
+
+## Anúncios somente texto, texto citado e links embutidos
+
+Ao criar um anúncio, depois do título você pode enviar:
+
+```txt
+1. Foto
+2. Vídeo
+3. Mensagem de texto pronta
+```
+
+Se enviar uma mensagem de texto pronta, o anúncio será salvo como **somente texto**. O bot preserva formatações feitas no próprio Telegram, como:
+
+```txt
+- Negrito
+- Itálico
+- Código
+- Spoiler
+- Texto citado / blockquote
+- Link embutido em palavra ou frase
+- Link normal no texto
+```
+
+Exemplo de anúncio de texto:
+
+```txt
+🔥 Sexy Prime VIP
+
+> Oferta exclusiva de hoje
+
+Clique no botão abaixo para acessar.
+```
+
+Depois disso, o bot ainda pergunta se você quer adicionar um botão URL separado, por exemplo:
+
+```txt
+Texto do botão: Entrar agora
+URL: https://t.me/seulink
+```
+
 ---
 
 ## Postagem automática de 3 em 3 horas
@@ -257,3 +300,31 @@ NOTIFY_SCHEDULED_POSTS=true
 ```
 
 Se quiser receber relatório no PV toda vez que a postagem automática rodar, altere `NOTIFY_INTERVAL_POSTS` para `true`.
+
+---
+
+## Atualizar o bot sem remover dos grupos/canais
+
+Esta versão adiciona os comandos:
+
+```txt
+/registrar
+/sincronizar
+```
+
+Use `/registrar` dentro de um grupo ou canal onde o bot já está. O bot vai registrar ou atualizar aquele destino no banco sem você precisar remover e adicionar novamente.
+
+Fluxo recomendado:
+
+```txt
+1. Faça deploy da nova versão no Render.
+2. Abra o grupo/canal onde o bot já está.
+3. Envie /registrar.
+4. No painel do dono, aprove o destino se ele aparecer como pendente.
+```
+
+Se o comando for enviado por um dono/admin do bot dentro de um grupo, o destino é aprovado automaticamente. Em canal, o destino pode ficar como pendente porque o Telegram não informa o usuário que postou no canal.
+
+Use `/sincronizar` no privado do bot para atualizar nome, tipo, status e permissão de fixação dos destinos que já existem no banco.
+
+Importante: a API do Telegram não permite que o bot descubra sozinho todos os grupos e canais onde ele já está. Se o banco SQLite do Render for apagado em redeploy/restart, será necessário enviar `/registrar` uma vez dentro de cada grupo/canal. Para não perder destinos entre deploys, use banco persistente externo ou uma hospedagem com disco persistente.
