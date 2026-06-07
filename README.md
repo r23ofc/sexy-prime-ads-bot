@@ -328,3 +328,22 @@ Se o comando for enviado por um dono/admin do bot dentro de um grupo, o destino 
 Use `/sincronizar` no privado do bot para atualizar nome, tipo, status e permissão de fixação dos destinos que já existem no banco.
 
 Importante: a API do Telegram não permite que o bot descubra sozinho todos os grupos e canais onde ele já está. Se o banco SQLite do Render for apagado em redeploy/restart, será necessário enviar `/registrar` uma vez dentro de cada grupo/canal. Para não perder destinos entre deploys, use banco persistente externo ou uma hospedagem com disco persistente.
+
+## Comandos ocultos nos grupos
+
+Esta versão remove os comandos do menu de `/` em grupos e canais.
+
+O bot continua aceitando comandos digitados manualmente, como `/registrar`, mas eles não ficam aparecendo como sugestão para os membros.
+
+Os comandos visíveis ficam somente no privado do bot:
+
+```txt
+/start
+/panel
+/id
+/sincronizar
+/help
+/backup
+```
+
+Depois do deploy, pode levar alguns minutos para o Telegram atualizar o cache dos comandos. Se ainda aparecer, feche e abra o Telegram ou teste em outro aparelho depois de alguns minutos.
