@@ -347,3 +347,37 @@ Os comandos visíveis ficam somente no privado do bot:
 ```
 
 Depois do deploy, pode levar alguns minutos para o Telegram atualizar o cache dos comandos. Se ainda aparecer, feche e abra o Telegram ou teste em outro aparelho depois de alguns minutos.
+
+---
+
+## Dois botões URL no mesmo anúncio
+
+Esta versão permite criar anúncios com até 2 botões de link.
+
+Fluxo:
+
+```txt
+1. Crie o anúncio normalmente.
+2. Envie o texto do botão 1.
+3. Envie a URL do botão 1.
+4. O bot pergunta se deseja adicionar o botão 2.
+5. Envie o texto do botão 2 ou envie: sem segundo botão.
+6. Se enviar o texto do botão 2, envie também a URL do botão 2.
+```
+
+Os botões aparecem um embaixo do outro para ficar melhor no mobile.
+
+Também é possível editar depois em:
+
+```txt
+Meus anúncios > escolher anúncio > Editar
+```
+
+Campos disponíveis:
+
+```txt
+Botão 1
+URL 1
+Botão 2
+URL 2
+```

@@ -183,6 +183,8 @@ class Database:
                     description TEXT NOT NULL,
                     button_text TEXT,
                     button_url TEXT,
+                    button2_text TEXT DEFAULT '',
+                    button2_url TEXT DEFAULT '',
                     pin_message INTEGER DEFAULT 1,
                     delete_previous INTEGER DEFAULT 1,
                     active INTEGER DEFAULT 1,
@@ -272,6 +274,16 @@ class Database:
                 """
             )
 
+            # Migração segura para versões antigas do banco: adiciona suporte a 2 botões URL.
+            for column_sql in (
+                "ALTER TABLE ads ADD COLUMN button2_text TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button2_url TEXT DEFAULT ''",
+            ):
+                try:
+                    cur.execute(column_sql)
+                except sqlite3.OperationalError:
+                    pass
+
             if OWNER_ID:
                 cur.execute(
                     """
@@ -324,10 +336,10 @@ class Database:
                 """
                 INSERT INTO ads (
                     title, media_type, media_file_id, description,
-                    button_text, button_url, pin_message, delete_previous,
+                    button_text, button_url, button2_text, button2_url, pin_message, delete_previous,
                     active, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     data["title"],
@@ -336,6 +348,8 @@ class Database:
                     data["description"],
                     data.get("button_text") or "",
                     data.get("button_url") or "",
+                    data.get("button2_text") or "",
+                    data.get("button2_url") or "",
                     int(data.get("pin_message", 1)),
                     int(data.get("delete_previous", 1)),
                     now_iso(),
@@ -353,6 +367,8 @@ class Database:
             "description",
             "button_text",
             "button_url",
+            "button2_text",
+            "button2_url",
             "pin_message",
             "delete_previous",
             "active",
@@ -723,10 +739,14 @@ def ad_edit_keyboard(ad):
             ],
             [
                 InlineKeyboardButton("Mídia", callback_data=f"ad:editmedia:{ad_id}"),
-                InlineKeyboardButton("Botão", callback_data=f"ad:editfield:{ad_id}:button_text"),
+                InlineKeyboardButton("Botão 1", callback_data=f"ad:editfield:{ad_id}:button_text"),
             ],
             [
-                InlineKeyboardButton("URL", callback_data=f"ad:editfield:{ad_id}:button_url"),
+                InlineKeyboardButton("URL 1", callback_data=f"ad:editfield:{ad_id}:button_url"),
+                InlineKeyboardButton("Botão 2", callback_data=f"ad:editfield:{ad_id}:button2_text"),
+            ],
+            [
+                InlineKeyboardButton("URL 2", callback_data=f"ad:editfield:{ad_id}:button2_url"),
             ],
             [
                 InlineKeyboardButton(pin, callback_data=f"ad:togglepin:{ad_id}"),
@@ -788,7 +808,8 @@ def ad_text(ad) -> str:
         f"📌 Anúncio #{ad['id']}\n\n"
         f"Nome: {ad['title']}\n"
         f"Mídia: {ad['media_type']}\n"
-        f"Botão: {ad['button_text'] or 'sem botão'}\n"
+        f"Botão 1: {ad['button_text'] or 'sem botão'}\n"
+        f"Botão 2: {ad['button2_text'] or 'sem botão'}\n"
         f"Fixar: {'sim' if ad['pin_message'] else 'não'}\n"
         f"Apagar anterior: {'sim' if ad['delete_previous'] else 'não'}\n"
         f"Status: {'ativo' if ad['active'] else 'desativado'}\n\n"
@@ -802,11 +823,20 @@ async def send_ad_to_chat(bot, chat_id: int, ad, *, preview=False) -> tuple[bool
     preview=True não apaga/fixa/loga e é usado só para o dono ver a prévia.
     """
     reply_markup = None
+    buttons = []
+
     button_text = (ad["button_text"] or "").strip()
     button_url = normalize_url(ad["button_url"] or "")
-
     if button_text and button_url and is_valid_url(button_url):
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=button_url)]])
+        buttons.append([InlineKeyboardButton(button_text, url=button_url)])
+
+    button2_text = (ad["button2_text"] or "").strip() if "button2_text" in ad.keys() else ""
+    button2_url = normalize_url(ad["button2_url"] or "") if "button2_url" in ad.keys() else ""
+    if button2_text and button2_url and is_valid_url(button2_url):
+        buttons.append([InlineKeyboardButton(button2_text, url=button2_url)])
+
+    if buttons:
+        reply_markup = InlineKeyboardMarkup(buttons)
 
     try:
         if not preview and int(ad["delete_previous"]):
@@ -1394,7 +1424,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 flow["step"] = "button_text"
                 await msg.reply_text(
                     "Mídia e legenda recebidas ✅\n\n"
-                    "Agora envie o texto do botão, ou envie: sem botão"
+                    "Agora envie o texto do botão 1, ou envie: sem botão"
                 )
                 return
 
@@ -1419,7 +1449,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 flow["step"] = "button_text"
                 await msg.reply_text(
                     "Vídeo e legenda recebidos ✅\n\n"
-                    "Agora envie o texto do botão, ou envie: sem botão"
+                    "Agora envie o texto do botão 1, ou envie: sem botão"
                 )
                 return
 
@@ -1478,12 +1508,14 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if step == "button_text":
         text = (msg.text or "").strip()
         if not text:
-            await msg.reply_text("Envie o texto do botão ou 'sem botão'.")
+            await msg.reply_text("Envie o texto do botão 1 ou 'sem botão'.")
             return
 
         if text.lower() in {"sem botão", "sem botao", "pular", "não", "nao"}:
             data["button_text"] = ""
             data["button_url"] = ""
+            data["button2_text"] = ""
+            data["button2_url"] = ""
             flow["step"] = "pin"
             await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
             return
@@ -1491,7 +1523,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         data["button_text"] = text[:50]
         flow["step"] = "button_url"
         await msg.reply_text(
-            "Agora envie o link do botão.\n\n"
+            "Agora envie o link do botão 1.\n\n"
             "Exemplo:\n"
             "https://t.me/seulink\n"
             "https://sxyprime.com"
@@ -1505,6 +1537,44 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
         data["button_url"] = url
+        flow["step"] = "button2_text"
+        await msg.reply_text(
+            "Quer adicionar um segundo botão URL?\n\n"
+            "Envie o texto do botão 2. Exemplo: Falar no suporte\n"
+            "Ou envie: sem segundo botão"
+        )
+        return
+
+    if step == "button2_text":
+        text = (msg.text or "").strip()
+        if not text:
+            await msg.reply_text("Envie o texto do botão 2 ou 'sem segundo botão'.")
+            return
+
+        if text.lower() in {"sem segundo botão", "sem segundo botao", "sem botão", "sem botao", "pular", "não", "nao"}:
+            data["button2_text"] = ""
+            data["button2_url"] = ""
+            flow["step"] = "pin"
+            await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
+            return
+
+        data["button2_text"] = text[:50]
+        flow["step"] = "button2_url"
+        await msg.reply_text(
+            "Agora envie o link do botão 2.\n\n"
+            "Exemplo:\n"
+            "https://t.me/seusupoorte\n"
+            "https://sxyprime.com"
+        )
+        return
+
+    if step == "button2_url":
+        url = normalize_url((msg.text or "").strip())
+        if not is_valid_url(url):
+            await msg.reply_text("Link inválido. Envie um link começando com https:// ou http://")
+            return
+
+        data["button2_url"] = url
         flow["step"] = "pin"
         await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
         return
@@ -1583,7 +1653,8 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     text = visible_text(msg)
-    if not text and field != "button_text":
+    button_text_fields = {"button_text", "button2_text"}
+    if not text and field not in button_text_fields:
         await msg.reply_text("Envie um texto válido.")
         return
 
@@ -1610,6 +1681,21 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         else:
             db.update_ad_field(ad_id, "button_url", url)
+    elif field == "button2_text":
+        if text.lower() in {"sem segundo botão", "sem segundo botao", "sem botão", "sem botao", "pular", "remover"}:
+            db.update_ad_field(ad_id, "button2_text", "")
+            db.update_ad_field(ad_id, "button2_url", "")
+        else:
+            db.update_ad_field(ad_id, "button2_text", text[:50])
+    elif field == "button2_url":
+        url = normalize_url(text)
+        if text.lower() in {"remover", "pular", "sem botão", "sem botao", "sem segundo botão", "sem segundo botao"}:
+            db.update_ad_field(ad_id, "button2_url", "")
+        elif not is_valid_url(url):
+            await msg.reply_text("URL inválida. Envie começando com https:// ou http://")
+            return
+        else:
+            db.update_ad_field(ad_id, "button2_url", url)
 
     context.user_data.clear()
     await msg.reply_text("✅ Anúncio atualizado.", reply_markup=ad_keyboard(ad_id))
@@ -1873,8 +1959,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         labels = {
             "title": "novo título",
             "description": "nova descrição",
-            "button_text": "novo texto do botão. Envie 'remover' para tirar o botão",
-            "button_url": "nova URL do botão. Envie 'remover' para tirar a URL",
+            "button_text": "novo texto do botão 1. Envie 'remover' para tirar o botão 1",
+            "button_url": "nova URL do botão 1. Envie 'remover' para tirar a URL 1",
+            "button2_text": "novo texto do botão 2. Envie 'remover' para tirar o botão 2",
+            "button2_url": "nova URL do botão 2. Envie 'remover' para tirar a URL 2",
         }
 
         context.user_data["flow"] = {"name": "edit_ad", "ad_id": ad_id, "field": field}
