@@ -258,6 +258,101 @@ def rich_text_payload(msg) -> tuple[str, str]:
     return rich_text_html(msg), ""
 
 
+def custom_emoji_entities(msg) -> list:
+    """Retorna entities de emoji premium/custom emoji recebidas na mensagem."""
+    found = []
+    for entity in message_entities(msg):
+        entity_type = str(getattr(entity, "type", "")).lower()
+        if entity_type.endswith("custom_emoji") or entity_type == "custom_emoji":
+            found.append(entity)
+    return found
+
+
+def entities_report(msg) -> str:
+    """Relatório simples das entities recebidas pelo bot."""
+    entities = message_entities(msg)
+    if not entities:
+        return "Nenhuma entity recebida nessa mensagem."
+
+    lines = []
+    for i, entity in enumerate(entities, 1):
+        entity_type = str(getattr(entity, "type", ""))
+        custom_id = getattr(entity, "custom_emoji_id", None)
+        offset = getattr(entity, "offset", "")
+        length = getattr(entity, "length", "")
+        extra = f" | custom_emoji_id={custom_id}" if custom_id else ""
+        lines.append(f"{i}. {entity_type} | offset={offset} | length={length}{extra}")
+    return "\n".join(lines)
+
+
+async def run_emoji_diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostica se o Telegram entregou custom emojis para o bot e testa reenvio."""
+    msg = update.effective_message
+    if not msg:
+        return
+
+    entities = message_entities(msg)
+    premium_entities = custom_emoji_entities(msg)
+    text = raw_text(msg)
+    forwarded = bool(
+        getattr(msg, "forward_origin", None)
+        or getattr(msg, "forward_from", None)
+        or getattr(msg, "forward_sender_name", None)
+        or getattr(msg, "forward_from_chat", None)
+    )
+
+    if premium_entities:
+        ids = []
+        for entity in premium_entities:
+            custom_id = getattr(entity, "custom_emoji_id", None)
+            if custom_id:
+                ids.append(str(custom_id))
+        unique_ids = list(dict.fromkeys(ids))
+        ids_text = "\n".join(f"• {item}" for item in unique_ids) or "• sem ID visível"
+        await msg.reply_text(
+            "✅ Emoji premium/custom emoji detectado pelo bot.\n\n"
+            f"Quantidade detectada: {len(premium_entities)}\n"
+            f"Mensagem encaminhada: {'sim' if forwarded else 'não'}\n\n"
+            "IDs detectados:\n"
+            f"{ids_text}\n\n"
+            "Agora vou reenviar abaixo o mesmo texto usando as entities recebidas. "
+            "Se no teste abaixo o emoji não aparecer premium, então o Telegram está bloqueando/convertendo na saída pelo bot."
+        )
+    else:
+        await msg.reply_text(
+            "❌ Nenhum emoji premium/custom emoji foi entregue ao bot nessa mensagem.\n\n"
+            f"Mensagem encaminhada: {'sim' if forwarded else 'não'}\n"
+            f"Entities totais recebidas: {len(entities)}\n\n"
+            "Relatório das entities:\n"
+            f"{entities_report(msg)}\n\n"
+            "Tente encaminhar a mensagem original direto para o bot, sem copiar e colar."
+        )
+        return
+
+    if text and entities:
+        try:
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=text,
+                entities=entities,
+                disable_web_page_preview=True,
+            )
+            await msg.reply_text(
+                "Teste enviado.\n\n"
+                "Se a mensagem acima apareceu sem emoji premium, o bot recebeu o ID, mas o Telegram não permitiu o reenvio premium."
+            )
+        except TelegramError as exc:
+            await msg.reply_text(
+                "⚠️ O bot detectou emoji premium, mas o Telegram recusou o reenvio com entities.\n\n"
+                f"Erro: {type(exc).__name__}: {exc}"
+            )
+    else:
+        await msg.reply_text(
+            "Detectei emoji premium, mas não encontrei texto/legenda bruto para reenviar no teste. "
+            "Tente encaminhar uma mensagem de texto com o emoji premium."
+        )
+
+
 def row_value(row, key: str, default=""):
     try:
         if row is not None and key in row.keys():
@@ -1240,6 +1335,7 @@ async def post_init(application: Application):
                 ("start", "Abrir o painel"),
                 ("panel", "Abrir o painel admin"),
                 ("id", "Ver seu ID do Telegram"),
+                ("testemoji", "Testar emoji premium"),
                 ("sincronizar", "Atualizar destinos já salvos"),
                 ("help", "Ajuda rápida"),
                 ("backup", "Baixar backup do banco"),
@@ -1400,6 +1496,18 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Para cadastrar destino sem remover o bot: envie /registrar dentro do grupo/canal. "
         "Depois aprove em Destinos pendentes, se ele não for aprovado automaticamente."
     )
+async def testemoji_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_update(update):
+        return
+    context.user_data.clear()
+    context.user_data["flow"] = {"name": "emoji_test"}
+    await update.message.reply_text(
+        "Envie ou encaminhe agora uma mensagem com emoji Premium/custom emoji.\n\n"
+        "Eu vou verificar se o Telegram entregou o custom_emoji_id para o bot e vou fazer um teste de reenvio.\n\n"
+        "Dica: encaminhe a mensagem original. Copiar e colar pode perder as entities."
+    )
+
+
 async def register_target_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
@@ -1543,7 +1651,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = flow.get("name")
 
-    if name == "new_ad":
+    if name == "emoji_test":
+        await run_emoji_diagnostic(update, context)
+        context.user_data.clear()
+    elif name == "new_ad":
         await handle_new_ad_flow(update, context, flow)
     elif name == "schedule_ad":
         await handle_schedule_flow(update, context, flow)
@@ -2571,6 +2682,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start, filters=private_only))
     app.add_handler(CommandHandler("panel", panel, filters=private_only))
     app.add_handler(CommandHandler("id", get_id, filters=private_only))
+    app.add_handler(CommandHandler(["testemoji", "testeemoji"], testemoji_cmd, filters=private_only))
     app.add_handler(CommandHandler("help", help_cmd, filters=private_only))
     app.add_handler(CommandHandler("sincronizar", sync_targets_cmd, filters=private_only))
     app.add_handler(CommandHandler("cancel", cancel_cmd, filters=private_only))

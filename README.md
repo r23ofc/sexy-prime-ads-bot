@@ -257,6 +257,28 @@ Como usar:
 
 Observação: isso depende do Telegram entregar as `entities` da mensagem ao bot e permitir o reenvio do `custom_emoji_id`. Em mensagens onde o Telegram remover a entity ao encaminhar, o bot não consegue recriar o emoji Premium do zero.
 
+### Testar se o bot recebeu o emoji Premium
+
+Use no privado do bot:
+
+```txt
+/testemoji
+```
+
+Depois envie ou encaminhe uma mensagem com emoji Premium/custom emoji. O bot vai responder:
+
+```txt
+✅ Emoji premium/custom emoji detectado pelo bot
+```
+
+ou:
+
+```txt
+❌ Nenhum emoji premium/custom emoji foi entregue ao bot nessa mensagem
+```
+
+Quando detectar, ele também faz um teste reenviando o mesmo texto com as mesmas `entities`. Se nesse teste o emoji aparecer comum, então o bot recebeu o ID, mas o Telegram bloqueou ou converteu o emoji Premium na saída do bot.
+
 ---
 
 ## Postagem automática de 3 em 3 horas
@@ -284,6 +306,7 @@ Importante:
 /start - abre painel
 /panel - abre painel admin
 /id - mostra seu ID
+/testemoji - testa se emoji Premium/custom emoji chegou ao bot
 /help - ajuda
 /addadmin ID - adiciona admin extra
 /removeadmin ID - remove admin extra
