@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import sqlite3
 import logging
 import asyncio
@@ -15,6 +16,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MessageEntity,
     BotCommandScopeDefault,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
@@ -189,9 +191,18 @@ def caption_limit(text: str) -> str:
     return str(text or "").strip()
 
 
+def raw_text(msg) -> str:
+    """Texto bruto recebido do Telegram, sem alterar espaços.
+
+    Isso é importante para preservar entities do Telegram, inclusive custom emojis
+    premium, porque os offsets das entities dependem exatamente do texto original.
+    """
+    return getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+
+
 def visible_text(msg) -> str:
     """Texto visível enviado pelo usuário, sem tags HTML."""
-    return (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
+    return raw_text(msg).strip()
 
 
 def rich_text_html(msg) -> str:
@@ -204,6 +215,57 @@ def rich_text_html(msg) -> str:
     if html:
         return str(html).strip()
     return visible_text(msg)
+
+
+def message_entities(msg) -> list:
+    """Entities de texto ou legenda enviadas/encaminhadas para o bot."""
+    return list(getattr(msg, "entities", None) or getattr(msg, "caption_entities", None) or [])
+
+
+def entities_to_json(entities: list) -> str:
+    if not entities:
+        return ""
+    try:
+        return json.dumps([entity.to_dict() for entity in entities], ensure_ascii=False)
+    except Exception as exc:
+        logger.warning("Não consegui serializar entities do anúncio: %s", exc)
+        return ""
+
+
+def entities_from_json(value: str | None, bot=None) -> list | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        raw_entities = json.loads(value)
+        return [MessageEntity.de_json(entity, bot) for entity in raw_entities]
+    except Exception as exc:
+        logger.warning("Não consegui restaurar entities do anúncio: %s", exc)
+        return None
+
+
+def rich_text_payload(msg) -> tuple[str, str]:
+    """
+    Retorna (texto, entities_json) para salvar no banco.
+
+    Quando a mensagem tem entities, salvamos o texto bruto + entities para preservar
+    emojis premium/custom emoji, links embutidos, negrito, spoiler e blockquote.
+    Quando não tem entities, mantemos o HTML antigo para compatibilidade.
+    """
+    entities = message_entities(msg)
+    if entities:
+        return raw_text(msg), entities_to_json(entities)
+    return rich_text_html(msg), ""
+
+
+def row_value(row, key: str, default=""):
+    try:
+        if row is not None and key in row.keys():
+            value = row[key]
+            return default if value is None else value
+    except Exception:
+        pass
+    return default
 
 
 class Database:
@@ -241,6 +303,7 @@ class Database:
                     media_type TEXT NOT NULL,
                     media_file_id TEXT NOT NULL,
                     description TEXT NOT NULL,
+                    description_entities TEXT DEFAULT '',
                     button_text TEXT,
                     button_url TEXT,
                     button_style TEXT DEFAULT '',
@@ -338,6 +401,7 @@ class Database:
 
             # Migração segura para versões antigas do banco: adiciona suporte a 2 botões URL e cor nos botões.
             for column_sql in (
+                "ALTER TABLE ads ADD COLUMN description_entities TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button_style TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button2_text TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button2_url TEXT DEFAULT ''",
@@ -399,17 +463,18 @@ class Database:
             cur = con.execute(
                 """
                 INSERT INTO ads (
-                    title, media_type, media_file_id, description,
+                    title, media_type, media_file_id, description, description_entities,
                     button_text, button_url, button_style, button2_text, button2_url, button2_style,
                     pin_message, delete_previous, active, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     data["title"],
                     data["media_type"],
                     data["media_file_id"],
                     data["description"],
+                    data.get("description_entities") or "",
                     data.get("button_text") or "",
                     data.get("button_url") or "",
                     normalize_button_style(data.get("button_style") or ""),
@@ -431,6 +496,7 @@ class Database:
             "media_type",
             "media_file_id",
             "description",
+            "description_entities",
             "button_text",
             "button_url",
             "button_style",
@@ -921,33 +987,49 @@ async def send_ad_to_chat(bot, chat_id: int, ad, *, preview=False) -> tuple[bool
                 except TelegramError as e:
                     logger.warning("Não consegui apagar postagem anterior em %s: %s", chat_id, e)
 
-        caption = caption_limit(ad["description"])
+        entities_json = row_value(ad, "description_entities", "")
+        saved_entities = entities_from_json(entities_json, bot)
+        # Quando há entities salvas, não aplicamos strip/corte no texto, porque
+        # os offsets das entities precisam bater exatamente com o texto original.
+        caption = str(ad["description"] or "") if saved_entities else caption_limit(ad["description"])
 
         if ad["media_type"] == "photo":
-            msg = await bot.send_photo(
-                chat_id=chat_id,
-                photo=ad["media_file_id"],
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
+            kwargs = {
+                "chat_id": chat_id,
+                "photo": ad["media_file_id"],
+                "caption": caption,
+                "reply_markup": reply_markup,
+            }
+            if saved_entities:
+                kwargs["caption_entities"] = saved_entities
+            else:
+                kwargs["parse_mode"] = ParseMode.HTML
+            msg = await bot.send_photo(**kwargs)
         elif ad["media_type"] == "video":
-            msg = await bot.send_video(
-                chat_id=chat_id,
-                video=ad["media_file_id"],
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                supports_streaming=True,
-                reply_markup=reply_markup,
-            )
+            kwargs = {
+                "chat_id": chat_id,
+                "video": ad["media_file_id"],
+                "caption": caption,
+                "supports_streaming": True,
+                "reply_markup": reply_markup,
+            }
+            if saved_entities:
+                kwargs["caption_entities"] = saved_entities
+            else:
+                kwargs["parse_mode"] = ParseMode.HTML
+            msg = await bot.send_video(**kwargs)
         else:
-            msg = await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False,
-                reply_markup=reply_markup,
-            )
+            kwargs = {
+                "chat_id": chat_id,
+                "text": caption,
+                "disable_web_page_preview": False,
+                "reply_markup": reply_markup,
+            }
+            if saved_entities:
+                kwargs["entities"] = saved_entities
+            else:
+                kwargs["parse_mode"] = ParseMode.HTML
+            msg = await bot.send_message(**kwargs)
 
         if not preview and int(ad["pin_message"]):
             try:
@@ -1499,7 +1581,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 if len(caption_plain) > 1024:
                     await msg.reply_text("A legenda da mídia passou de 1024 caracteres. Envie uma legenda menor.")
                     return
-                data["description"] = rich_text_html(msg)
+                data["description"], data["description_entities"] = rich_text_payload(msg)
                 flow["step"] = "button_text"
                 await msg.reply_text(
                     "Mídia e legenda recebidas ✅\n\n"
@@ -1524,7 +1606,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 if len(caption_plain) > 1024:
                     await msg.reply_text("A legenda da mídia passou de 1024 caracteres. Envie uma legenda menor.")
                     return
-                data["description"] = rich_text_html(msg)
+                data["description"], data["description_entities"] = rich_text_payload(msg)
                 flow["step"] = "button_text"
                 await msg.reply_text(
                     "Vídeo e legenda recebidos ✅\n\n"
@@ -1548,7 +1630,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 return
             data["media_type"] = "text"
             data["media_file_id"] = ""
-            data["description"] = rich_text_html(msg)
+            data["description"], data["description_entities"] = rich_text_payload(msg)
             flow["step"] = "button_text"
             await msg.reply_text(
                 "Texto do anúncio recebido ✅\n\n"
@@ -1572,7 +1654,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if len(text_plain) > 1024:
             await msg.reply_text("A descrição passou de 1024 caracteres. Envie uma versão menor.")
             return
-        data["description"] = rich_text_html(msg)
+        data["description"], data["description_entities"] = rich_text_payload(msg)
         flow["step"] = "button_text"
         await msg.reply_text(
             "Agora envie o texto do botão.\n\n"
@@ -1732,7 +1814,9 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if len(visible_text(msg)) > 1024:
                     await msg.reply_text("A legenda passou de 1024 caracteres. Envie uma legenda menor.")
                     return
-                db.update_ad_field(ad_id, "description", rich_text_html(msg))
+                desc_value, entities_value = rich_text_payload(msg)
+                db.update_ad_field(ad_id, "description", desc_value)
+                db.update_ad_field(ad_id, "description_entities", entities_value)
         elif msg.video:
             db.update_ad_field(ad_id, "media_type", "video")
             db.update_ad_field(ad_id, "media_file_id", msg.video.file_id)
@@ -1740,14 +1824,18 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if len(visible_text(msg)) > 1024:
                     await msg.reply_text("A legenda passou de 1024 caracteres. Envie uma legenda menor.")
                     return
-                db.update_ad_field(ad_id, "description", rich_text_html(msg))
+                desc_value, entities_value = rich_text_payload(msg)
+                db.update_ad_field(ad_id, "description", desc_value)
+                db.update_ad_field(ad_id, "description_entities", entities_value)
         elif visible_text(msg):
             if len(visible_text(msg)) > 4096:
                 await msg.reply_text("Esse texto passou de 4096 caracteres. Envie uma versão menor.")
                 return
             db.update_ad_field(ad_id, "media_type", "text")
             db.update_ad_field(ad_id, "media_file_id", "")
-            db.update_ad_field(ad_id, "description", rich_text_html(msg))
+            desc_value, entities_value = rich_text_payload(msg)
+            db.update_ad_field(ad_id, "description", desc_value)
+            db.update_ad_field(ad_id, "description_entities", entities_value)
         else:
             await msg.reply_text("Envie uma foto, vídeo ou texto válido.")
             return
@@ -1770,7 +1858,9 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(text) > max_len:
             await msg.reply_text(f"A descrição passou de {max_len} caracteres. Envie uma versão menor.")
             return
-        db.update_ad_field(ad_id, "description", rich_text_html(msg))
+        desc_value, entities_value = rich_text_payload(msg)
+        db.update_ad_field(ad_id, "description", desc_value)
+        db.update_ad_field(ad_id, "description_entities", entities_value)
     elif field == "button_text":
         if text.lower() in {"sem botão", "sem botao", "pular", "remover"}:
             db.update_ad_field(ad_id, "button_text", "")

@@ -8,6 +8,7 @@ Bot de anúncios para a Agência Sexy Prime com painel pelo Telegram, mídia ou 
 - Usuário comum recebe aviso de uso exclusivo
 - Criar anúncio com foto, vídeo ou somente texto
 - Aceita textos citados/blockquote do Telegram, links embutidos e mensagens de texto com redirecionamento
+- Preserva emojis especiais/Premium quando a mensagem encaminhada ou enviada para o bot trouxer custom emoji
 - Descrição + botão URL
 - Prévia antes de postar
 - Postar agora
@@ -210,6 +211,7 @@ Se enviar uma mensagem de texto pronta, o anúncio será salvo como **somente te
 - Texto citado / blockquote
 - Link embutido em palavra ou frase
 - Link normal no texto
+- Emoji especial/Premium do Telegram, inclusive em mensagem encaminhada, quando o Telegram entregar a entity `custom_emoji` para o bot
 ```
 
 Exemplo de anúncio de texto:
@@ -228,6 +230,32 @@ Depois disso, o bot ainda pergunta se você quer adicionar um botão URL separad
 Texto do botão: Entrar agora
 URL: https://t.me/seulink
 ```
+
+
+---
+
+## Emojis especiais/Premium e mensagens encaminhadas
+
+Esta versão salva o texto bruto junto com as `entities` do Telegram. Isso permite preservar:
+
+```txt
+- Emojis especiais/Premium enviados por você
+- Emojis especiais/Premium de mensagens encaminhadas de outras pessoas
+- Links embutidos
+- Texto citado / blockquote
+- Negrito, itálico, spoiler e código
+```
+
+Como usar:
+
+```txt
+1. Crie um anúncio normalmente.
+2. Na etapa do conteúdo, encaminhe para o bot a mensagem que tem o emoji Premium.
+3. O bot salva o texto + entities.
+4. Ao postar, ele tenta reenviar preservando o custom emoji.
+```
+
+Observação: isso depende do Telegram entregar as `entities` da mensagem ao bot e permitir o reenvio do `custom_emoji_id`. Em mensagens onde o Telegram remover a entity ao encaminhar, o bot não consegue recriar o emoji Premium do zero.
 
 ---
 
