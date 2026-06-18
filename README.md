@@ -381,3 +381,30 @@ URL 1
 Botão 2
 URL 2
 ```
+
+## Correção: /start em grupos não abre painel
+
+Nesta versão, o painel administrativo só abre no privado do bot. Se alguém, inclusive o dono, enviar `/start` ou `/panel` dentro de grupo/canal, o bot ignora e não mostra os botões de criação de anúncio.
+
+O comando `/registrar` continua funcionando em grupo/canal para atualizar o destino sem precisar remover e adicionar o bot novamente, mas ele não aparece como sugestão no menu de `/`.
+
+## Cores nos botões URL
+
+Esta versão aceita cor nos botões URL do anúncio.
+
+Opções aceitas:
+
+- `padrão` — usa o estilo normal do Telegram
+- `azul` — estilo `primary`
+- `verde` — estilo `success`
+- `vermelho` — estilo `danger`
+
+Durante a criação do anúncio, depois de enviar a URL de cada botão, o bot pergunta a cor do botão. Em anúncios antigos, a cor fica como `padrão` até você editar.
+
+Para editar depois:
+
+```txt
+/start > 📋 Meus anúncios > escolher anúncio > ✏️ Editar > Cor 1 ou Cor 2
+```
+
+Observação: a exibição da cor depende do suporte do Telegram/cliente usado pelo usuário. Em clientes antigos pode aparecer como botão normal.

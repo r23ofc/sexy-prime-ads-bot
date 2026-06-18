@@ -57,6 +57,66 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "sim", "on", "ativo"}
 
 
+# Estilos oficiais do Telegram para botões.
+# vazio = padrão do app; primary = azul; success = verde; danger = vermelho.
+BUTTON_STYLE_ALIASES = {
+    "": "",
+    "padrao": "",
+    "padrão": "",
+    "normal": "",
+    "default": "",
+    "sem cor": "",
+    "azul": "primary",
+    "blue": "primary",
+    "primary": "primary",
+    "primario": "primary",
+    "primário": "primary",
+    "verde": "success",
+    "green": "success",
+    "success": "success",
+    "sucesso": "success",
+    "vermelho": "danger",
+    "red": "danger",
+    "danger": "danger",
+    "perigo": "danger",
+}
+
+BUTTON_STYLE_NAMES = {
+    "": "padrão",
+    "primary": "azul",
+    "success": "verde",
+    "danger": "vermelho",
+}
+
+
+def normalize_button_style(value: str | None) -> str:
+    value = (value or "").strip().lower()
+    return BUTTON_STYLE_ALIASES.get(value, "")
+
+
+def button_style_name(value: str | None) -> str:
+    return BUTTON_STYLE_NAMES.get((value or "").strip(), "padrão")
+
+
+def style_help_text(button_number: int) -> str:
+    return (
+        f"Agora escolha a cor do botão {button_number}.\n\n"
+        "Envie uma dessas opções:\n"
+        "padrão\n"
+        "azul\n"
+        "verde\n"
+        "vermelho"
+    )
+
+
+def url_button(text: str, url: str, style: str | None = "") -> InlineKeyboardButton:
+    style = normalize_button_style(style)
+    if style:
+        # api_kwargs envia o campo novo mesmo se a biblioteca ainda não expor style diretamente.
+        return InlineKeyboardButton(text, url=url, api_kwargs={"style": style})
+    return InlineKeyboardButton(text, url=url)
+
+
 # Notificações privadas para o dono.
 # Por padrão, a postagem automática por intervalo NÃO avisa no PV a cada execução,
 # para não ficar enchendo o chat do dono.
@@ -183,8 +243,10 @@ class Database:
                     description TEXT NOT NULL,
                     button_text TEXT,
                     button_url TEXT,
+                    button_style TEXT DEFAULT '',
                     button2_text TEXT DEFAULT '',
                     button2_url TEXT DEFAULT '',
+                    button2_style TEXT DEFAULT '',
                     pin_message INTEGER DEFAULT 1,
                     delete_previous INTEGER DEFAULT 1,
                     active INTEGER DEFAULT 1,
@@ -274,10 +336,12 @@ class Database:
                 """
             )
 
-            # Migração segura para versões antigas do banco: adiciona suporte a 2 botões URL.
+            # Migração segura para versões antigas do banco: adiciona suporte a 2 botões URL e cor nos botões.
             for column_sql in (
+                "ALTER TABLE ads ADD COLUMN button_style TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button2_text TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button2_url TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button2_style TEXT DEFAULT ''",
             ):
                 try:
                     cur.execute(column_sql)
@@ -336,10 +400,10 @@ class Database:
                 """
                 INSERT INTO ads (
                     title, media_type, media_file_id, description,
-                    button_text, button_url, button2_text, button2_url, pin_message, delete_previous,
-                    active, created_at, updated_at
+                    button_text, button_url, button_style, button2_text, button2_url, button2_style,
+                    pin_message, delete_previous, active, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     data["title"],
@@ -348,8 +412,10 @@ class Database:
                     data["description"],
                     data.get("button_text") or "",
                     data.get("button_url") or "",
+                    normalize_button_style(data.get("button_style") or ""),
                     data.get("button2_text") or "",
                     data.get("button2_url") or "",
+                    normalize_button_style(data.get("button2_style") or ""),
                     int(data.get("pin_message", 1)),
                     int(data.get("delete_previous", 1)),
                     now_iso(),
@@ -367,8 +433,10 @@ class Database:
             "description",
             "button_text",
             "button_url",
+            "button_style",
             "button2_text",
             "button2_url",
+            "button2_style",
             "pin_message",
             "delete_previous",
             "active",
@@ -746,7 +814,11 @@ def ad_edit_keyboard(ad):
                 InlineKeyboardButton("Botão 2", callback_data=f"ad:editfield:{ad_id}:button2_text"),
             ],
             [
+                InlineKeyboardButton("Cor 1", callback_data=f"ad:editfield:{ad_id}:button_style"),
                 InlineKeyboardButton("URL 2", callback_data=f"ad:editfield:{ad_id}:button2_url"),
+            ],
+            [
+                InlineKeyboardButton("Cor 2", callback_data=f"ad:editfield:{ad_id}:button2_style"),
             ],
             [
                 InlineKeyboardButton(pin, callback_data=f"ad:togglepin:{ad_id}"),
@@ -808,8 +880,8 @@ def ad_text(ad) -> str:
         f"📌 Anúncio #{ad['id']}\n\n"
         f"Nome: {ad['title']}\n"
         f"Mídia: {ad['media_type']}\n"
-        f"Botão 1: {ad['button_text'] or 'sem botão'}\n"
-        f"Botão 2: {ad['button2_text'] or 'sem botão'}\n"
+        f"Botão 1: {ad['button_text'] or 'sem botão'} | Cor: {button_style_name(ad['button_style'] if 'button_style' in ad.keys() else '')}\n"
+        f"Botão 2: {ad['button2_text'] or 'sem botão'} | Cor: {button_style_name(ad['button2_style'] if 'button2_style' in ad.keys() else '')}\n"
         f"Fixar: {'sim' if ad['pin_message'] else 'não'}\n"
         f"Apagar anterior: {'sim' if ad['delete_previous'] else 'não'}\n"
         f"Status: {'ativo' if ad['active'] else 'desativado'}\n\n"
@@ -828,12 +900,14 @@ async def send_ad_to_chat(bot, chat_id: int, ad, *, preview=False) -> tuple[bool
     button_text = (ad["button_text"] or "").strip()
     button_url = normalize_url(ad["button_url"] or "")
     if button_text and button_url and is_valid_url(button_url):
-        buttons.append([InlineKeyboardButton(button_text, url=button_url)])
+        button_style = ad["button_style"] if "button_style" in ad.keys() else ""
+        buttons.append([url_button(button_text, button_url, button_style)])
 
     button2_text = (ad["button2_text"] or "").strip() if "button2_text" in ad.keys() else ""
     button2_url = normalize_url(ad["button2_url"] or "") if "button2_url" in ad.keys() else ""
     if button2_text and button2_url and is_valid_url(button2_url):
-        buttons.append([InlineKeyboardButton(button2_text, url=button2_url)])
+        button2_style = ad["button2_style"] if "button2_style" in ad.keys() else ""
+        buttons.append([url_button(button2_text, button2_url, button2_style)])
 
     if buttons:
         reply_markup = InlineKeyboardMarkup(buttons)
@@ -1201,6 +1275,11 @@ async def sync_saved_targets(bot) -> dict:
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # O painel nunca deve abrir em grupos/canais, mesmo se o dono digitar /start lá.
+    # Isso evita expor botões de criação de anúncio para membros do grupo.
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+
     if not await require_admin_update(update):
         return
 
@@ -1514,8 +1593,10 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if text.lower() in {"sem botão", "sem botao", "pular", "não", "nao"}:
             data["button_text"] = ""
             data["button_url"] = ""
+            data["button_style"] = ""
             data["button2_text"] = ""
             data["button2_url"] = ""
+            data["button2_style"] = ""
             flow["step"] = "pin"
             await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
             return
@@ -1537,6 +1618,17 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
         data["button_url"] = url
+        flow["step"] = "button_style"
+        await msg.reply_text(style_help_text(1))
+        return
+
+    if step == "button_style":
+        style = normalize_button_style((msg.text or "").strip())
+        text = (msg.text or "").strip().lower()
+        if text and text not in BUTTON_STYLE_ALIASES:
+            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
+            return
+        data["button_style"] = style
         flow["step"] = "button2_text"
         await msg.reply_text(
             "Quer adicionar um segundo botão URL?\n\n"
@@ -1554,6 +1646,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if text.lower() in {"sem segundo botão", "sem segundo botao", "sem botão", "sem botao", "pular", "não", "nao"}:
             data["button2_text"] = ""
             data["button2_url"] = ""
+            data["button2_style"] = ""
             flow["step"] = "pin"
             await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
             return
@@ -1575,6 +1668,17 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
         data["button2_url"] = url
+        flow["step"] = "button2_style"
+        await msg.reply_text(style_help_text(2))
+        return
+
+    if step == "button2_style":
+        style = normalize_button_style((msg.text or "").strip())
+        text = (msg.text or "").strip().lower()
+        if text and text not in BUTTON_STYLE_ALIASES:
+            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
+            return
+        data["button2_style"] = style
         flow["step"] = "pin"
         await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
         return
@@ -1654,7 +1758,8 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text = visible_text(msg)
     button_text_fields = {"button_text", "button2_text"}
-    if not text and field not in button_text_fields:
+    button_style_fields = {"button_style", "button2_style"}
+    if not text and field not in button_text_fields and field not in button_style_fields:
         await msg.reply_text("Envie um texto válido.")
         return
 
@@ -1670,32 +1775,52 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         if text.lower() in {"sem botão", "sem botao", "pular", "remover"}:
             db.update_ad_field(ad_id, "button_text", "")
             db.update_ad_field(ad_id, "button_url", "")
+            db.update_ad_field(ad_id, "button_style", "")
         else:
             db.update_ad_field(ad_id, "button_text", text[:50])
     elif field == "button_url":
         url = normalize_url(text)
         if text.lower() in {"remover", "pular", "sem botão", "sem botao"}:
             db.update_ad_field(ad_id, "button_url", "")
+            db.update_ad_field(ad_id, "button_style", "")
         elif not is_valid_url(url):
             await msg.reply_text("URL inválida. Envie começando com https:// ou http://")
             return
         else:
             db.update_ad_field(ad_id, "button_url", url)
+    elif field == "button_style":
+        if text.lower() in {"remover", "pular", "sem cor", "sem botão", "sem botao"}:
+            db.update_ad_field(ad_id, "button_style", "")
+        elif text.lower() not in BUTTON_STYLE_ALIASES:
+            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
+            return
+        else:
+            db.update_ad_field(ad_id, "button_style", normalize_button_style(text))
     elif field == "button2_text":
         if text.lower() in {"sem segundo botão", "sem segundo botao", "sem botão", "sem botao", "pular", "remover"}:
             db.update_ad_field(ad_id, "button2_text", "")
             db.update_ad_field(ad_id, "button2_url", "")
+            db.update_ad_field(ad_id, "button2_style", "")
         else:
             db.update_ad_field(ad_id, "button2_text", text[:50])
     elif field == "button2_url":
         url = normalize_url(text)
         if text.lower() in {"remover", "pular", "sem botão", "sem botao", "sem segundo botão", "sem segundo botao"}:
             db.update_ad_field(ad_id, "button2_url", "")
+            db.update_ad_field(ad_id, "button2_style", "")
         elif not is_valid_url(url):
             await msg.reply_text("URL inválida. Envie começando com https:// ou http://")
             return
         else:
             db.update_ad_field(ad_id, "button2_url", url)
+    elif field == "button2_style":
+        if text.lower() in {"remover", "pular", "sem cor", "sem botão", "sem botao", "sem segundo botão", "sem segundo botao"}:
+            db.update_ad_field(ad_id, "button2_style", "")
+        elif text.lower() not in BUTTON_STYLE_ALIASES:
+            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
+            return
+        else:
+            db.update_ad_field(ad_id, "button2_style", normalize_button_style(text))
 
     context.user_data.clear()
     await msg.reply_text("✅ Anúncio atualizado.", reply_markup=ad_keyboard(ad_id))
@@ -1961,8 +2086,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "description": "nova descrição",
             "button_text": "novo texto do botão 1. Envie 'remover' para tirar o botão 1",
             "button_url": "nova URL do botão 1. Envie 'remover' para tirar a URL 1",
+            "button_style": "cor do botão 1: padrão, azul, verde ou vermelho. Envie 'remover' para voltar ao padrão",
             "button2_text": "novo texto do botão 2. Envie 'remover' para tirar o botão 2",
             "button2_url": "nova URL do botão 2. Envie 'remover' para tirar a URL 2",
+            "button2_style": "cor do botão 2: padrão, azul, verde ou vermelho. Envie 'remover' para voltar ao padrão",
         }
 
         context.user_data["flow"] = {"name": "edit_ad", "ad_id": ad_id, "field": field}
@@ -2310,21 +2437,27 @@ def build_application() -> Application:
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("panel", panel))
-    app.add_handler(CommandHandler("id", get_id))
-    app.add_handler(CommandHandler("help", help_cmd))
+    # Comandos administrativos só funcionam no privado do bot.
+    # Em grupos/canais, /start e /panel são ignorados para não mostrar painel de anúncios aos membros.
+    private_only = filters.ChatType.PRIVATE
+    app.add_handler(CommandHandler("start", start, filters=private_only))
+    app.add_handler(CommandHandler("panel", panel, filters=private_only))
+    app.add_handler(CommandHandler("id", get_id, filters=private_only))
+    app.add_handler(CommandHandler("help", help_cmd, filters=private_only))
+    app.add_handler(CommandHandler("sincronizar", sync_targets_cmd, filters=private_only))
+    app.add_handler(CommandHandler("cancel", cancel_cmd, filters=private_only))
+    app.add_handler(CommandHandler("addadmin", add_admin_cmd, filters=private_only))
+    app.add_handler(CommandHandler("removeadmin", remove_admin_cmd, filters=private_only))
+    app.add_handler(CommandHandler("backup", backup_cmd, filters=private_only))
+
+    # Único comando aceito em grupo/canal, mas ele não aparece no menu de /.
     app.add_handler(CommandHandler("registrar", register_target_cmd))
-    app.add_handler(CommandHandler("sincronizar", sync_targets_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CommandHandler("addadmin", add_admin_cmd))
-    app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
-    app.add_handler(CommandHandler("backup", backup_cmd))
 
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(buttons))
 
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.TEXT, handle_message))
+    # Fluxos de criação/edição de anúncio só no privado.
+    app.add_handler(MessageHandler(private_only & (filters.PHOTO | filters.VIDEO | filters.TEXT) & ~filters.COMMAND, handle_message))
 
     app.add_error_handler(error_handler)
     return app

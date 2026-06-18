@@ -24,6 +24,10 @@ services:
         sync: false
       - key: WEBHOOK_PATH
         sync: false
+      - key: NOTIFY_INTERVAL_POSTS
+        value: false
+      - key: NOTIFY_SCHEDULED_POSTS
+        value: true
 
   # Opcional: Cron Job do próprio Render para pingar o bot.
   # Atenção: segundo a documentação do Render, Cron Jobs têm cobrança mínima mensal.
