@@ -388,23 +388,18 @@ Nesta versão, o painel administrativo só abre no privado do bot. Se alguém, i
 
 O comando `/registrar` continua funcionando em grupo/canal para atualizar o destino sem precisar remover e adicionar o bot novamente, mas ele não aparece como sugestão no menu de `/`.
 
-## Cores nos botões URL
+## Correção: permissões do bot não geram pedido de aprovação
 
-Esta versão aceita cor nos botões URL do anúncio.
+Nesta versão, o bot só envia a mensagem **Novo destino detectado** quando ele realmente acaba de entrar em um grupo/canal.
 
-Opções aceitas:
-
-- `padrão` — usa o estilo normal do Telegram
-- `azul` — estilo `primary`
-- `verde` — estilo `success`
-- `vermelho` — estilo `danger`
-
-Durante a criação do anúncio, depois de enviar a URL de cada botão, o bot pergunta a cor do botão. Em anúncios antigos, a cor fica como `padrão` até você editar.
-
-Para editar depois:
+Não gera mais pedido de aprovação quando:
 
 ```txt
-/start > 📋 Meus anúncios > escolher anúncio > ✏️ Editar > Cor 1 ou Cor 2
+- você tira o admin do bot
+- você coloca o bot como admin novamente
+- você altera permissões do bot
+- o Render faz novo deploy
+- o status do bot no grupo é atualizado pelo Telegram
 ```
 
-Observação: a exibição da cor depende do suporte do Telegram/cliente usado pelo usuário. Em clientes antigos pode aparecer como botão normal.
+Quando o bot for removido ou bloqueado no grupo/canal, o destino é marcado como inativo no banco e não aparece como pendente para aprovação.

@@ -2357,16 +2357,48 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = event.chat
+    old = event.old_chat_member
     new = event.new_chat_member
 
+    old_status = getattr(old, "status", None)
     status = new.status
     chat_id = int(chat.id)
     title = chat.title or chat.username or str(chat_id)
     chat_type = chat.type
 
-    if status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
+    active_statuses = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
+    inactive_statuses = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
+
+    target_before = db.get_target(chat_id)
+    was_inactive_before_update = old_status in inactive_statuses
+    was_active_before_update = old_status in active_statuses
+
+    if status in active_statuses:
         can_pin = bool(getattr(new, "can_pin_messages", False))
         db.upsert_target(chat_id, title, chat_type, can_pin)
+
+        # Só manda tela de aprovação quando o bot realmente acabou de entrar no grupo/canal.
+        # Alteração de permissão, tirar admin, colocar admin ou update após deploy NÃO deve gerar
+        # novo pedido de aprovação no PV do dono.
+        is_real_new_entry = (
+            target_before is None
+            and (was_inactive_before_update or old_status is None)
+            and not was_active_before_update
+        ) or (
+            target_before is not None
+            and not int(target_before["active"])
+            and was_inactive_before_update
+        )
+
+        if not is_real_new_entry:
+            logger.info(
+                "Destino atualizado sem pedir aprovação: %s | old=%s new=%s can_pin=%s",
+                chat_id,
+                old_status,
+                status,
+                can_pin,
+            )
+            return
 
         text = (
             "📍 Novo destino detectado\n\n"
@@ -2394,7 +2426,7 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError as e:
             logger.warning("Não consegui avisar o dono sobre novo destino: %s", e)
 
-    elif status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}:
+    elif status in inactive_statuses:
         db.mark_target_inactive(chat_id)
         try:
             await context.bot.send_message(
@@ -2403,6 +2435,12 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except TelegramError:
             pass
+
+    else:
+        # Restrição/permissão limitada não deve gerar pedido de aprovação.
+        # Mantemos fora dos destinos ativos para não tentar postar onde o bot não consegue atuar.
+        db.mark_target_inactive(chat_id)
+        logger.info("Destino marcado como inativo por status do bot: %s | status=%s", chat_id, status)
 
 
 # ============================================================
