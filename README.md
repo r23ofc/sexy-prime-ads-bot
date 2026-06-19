@@ -9,11 +9,12 @@ Bot de anúncios para a Agência Sexy Prime com painel pelo Telegram, mídia ou 
 - Criar anúncio com foto, vídeo ou somente texto
 - Aceita textos citados/blockquote do Telegram, links embutidos e mensagens de texto com redirecionamento
 - Preserva emojis especiais/Premium quando a mensagem encaminhada ou enviada para o bot trouxer custom emoji
-- Descrição + botão URL
+- Descrição + até 5 botões URL no mesmo anúncio
 - Prévia antes de postar
 - Postar agora
 - Agendar por horário
-- Postagem automática por intervalo: 1h, 2h, 3h, 4h, 6h ou 12h
+- Postagem automática por intervalo: 5, 10, 15, 20, 25 e 30 minutos, além de 1h, 2h, 3h, 4h, 6h e 12h
+- Vários anúncios automáticos ativos ao mesmo tempo
 - Fixar anúncio automaticamente
 - Apagar postagem anterior do bot
 - Aprovar/rejeitar grupos e canais
@@ -227,8 +228,10 @@ Clique no botão abaixo para acessar.
 Depois disso, o bot ainda pergunta se você quer adicionar um botão URL separado, por exemplo:
 
 ```txt
-Texto do botão: Entrar agora
-URL: https://t.me/seulink
+Texto do botão 1: Entrar agora
+URL 1: https://t.me/seulink
+
+Depois você pode adicionar botão 2, 3, 4 e 5, ou enviar: sem botão
 ```
 
 
@@ -281,20 +284,47 @@ Quando detectar, ele também faz um teste reenviando o mesmo texto com as mesmas
 
 ---
 
-## Postagem automática de 3 em 3 horas
+## Postagem automática com vários anúncios ao mesmo tempo
 
-Depois de criar um anúncio:
+Você pode deixar quantos anúncios quiser rodando automaticamente. Cada anúncio pode ter o seu próprio intervalo.
+
+Exemplo:
 
 ```txt
-/start > 📋 Meus anúncios > escolha o anúncio > 🔁 Automático > 3 em 3 horas
+Anúncio #1: a cada 5 min
+Anúncio #2: a cada 15 min
+Anúncio #3: a cada 3h
+Anúncio #4: a cada 12h
 ```
 
-O bot vai postar esse anúncio automaticamente em todos os destinos aprovados ativos a cada 3 horas.
+Para ativar:
+
+```txt
+/start > 📋 Meus anúncios > escolha o anúncio > 🔁 Automático
+```
+
+Opções disponíveis:
+
+```txt
+5 min
+10 min
+15 min
+20 min
+25 min
+30 min
+1h
+2h
+3h
+4h
+6h
+12h
+```
 
 Importante:
 
 - A primeira postagem automática acontece depois do intervalo escolhido.
 - Para postar imediatamente, use `🚀 Postar agora`.
+- Você pode ativar vários anúncios diferentes ao mesmo tempo.
 - Se ativar outro intervalo para o mesmo anúncio, o intervalo antigo daquele anúncio é parado automaticamente.
 - Para parar, use `🔁 Postagem automática` no painel e clique em `⛔ Parar automático`.
 
@@ -401,9 +431,9 @@ Depois do deploy, pode levar alguns minutos para o Telegram atualizar o cache do
 
 ---
 
-## Dois botões URL no mesmo anúncio
+## Até 5 botões URL no mesmo anúncio
 
-Esta versão permite criar anúncios com até 2 botões de link.
+Esta versão permite criar anúncios com até 5 botões de link.
 
 Fluxo:
 
@@ -411,9 +441,9 @@ Fluxo:
 1. Crie o anúncio normalmente.
 2. Envie o texto do botão 1.
 3. Envie a URL do botão 1.
-4. O bot pergunta se deseja adicionar o botão 2.
-5. Envie o texto do botão 2 ou envie: sem segundo botão.
-6. Se enviar o texto do botão 2, envie também a URL do botão 2.
+4. Escolha a cor do botão 1.
+5. O bot pergunta se deseja adicionar o botão 2.
+6. Repita até o botão 5 ou envie: sem botão.
 ```
 
 Os botões aparecem um embaixo do outro para ficar melhor no mobile.
@@ -427,11 +457,13 @@ Meus anúncios > escolher anúncio > Editar
 Campos disponíveis:
 
 ```txt
-Botão 1
-URL 1
-Botão 2
-URL 2
+Botão 1 / URL 1 / Cor 1
+Botão 2 / URL 2 / Cor 2
+Botão 3 / URL 3 / Cor 3
+Botão 4 / URL 4 / Cor 4
+Botão 5 / URL 5 / Cor 5
 ```
+
 
 ## Correção: /start em grupos não abre painel
 

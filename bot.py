@@ -51,6 +51,11 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/SXP_suporte").strip()
 TIMEZONE_NAME = os.getenv("TIMEZONE", "America/Sao_Paulo").strip()
 DB_PATH = os.getenv("DB_PATH", "data/sexy_prime_ads.db").strip()
 
+# Limites do bot
+MAX_URL_BUTTONS = 5
+MINUTE_INTERVAL_OPTIONS = [5, 10, 15, 20, 25, 30]
+HOUR_INTERVAL_OPTIONS = [1, 2, 3, 4, 6, 12]
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name, "").strip().lower()
@@ -117,6 +122,64 @@ def url_button(text: str, url: str, style: str | None = "") -> InlineKeyboardBut
         # api_kwargs envia o campo novo mesmo se a biblioteca ainda não expor style diretamente.
         return InlineKeyboardButton(text, url=url, api_kwargs={"style": style})
     return InlineKeyboardButton(text, url=url)
+
+
+def button_field(number: int, suffix: str) -> str:
+    """Mapeia botão 1 para button_text/button_url/button_style e demais para buttonN_*.
+    Ex.: (1, 'text') -> button_text | (3, 'url') -> button3_url.
+    """
+    if number == 1:
+        return f"button_{suffix}"
+    return f"button{number}_{suffix}"
+
+
+def button_value(row, number: int, suffix: str, default: str = "") -> str:
+    return str(row_value(row, button_field(number, suffix), default) or "")
+
+
+def is_skip_button_text(text: str, number: int = 1) -> bool:
+    text = (text or "").strip().lower()
+    skips = {"sem botão", "sem botao", "pular", "não", "nao", "remover"}
+    if number > 1:
+        skips.update({"sem segundo botão", "sem segundo botao", "sem próximo", "sem proximo", "sem mais", "finalizar"})
+    return text in skips
+
+
+def clear_button_data(data: dict, number: int):
+    data[button_field(number, "text")] = ""
+    data[button_field(number, "url")] = ""
+    data[button_field(number, "style")] = ""
+
+
+def clear_buttons_from(data: dict, start_number: int):
+    for n in range(start_number, MAX_URL_BUTTONS + 1):
+        clear_button_data(data, n)
+
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def interval_minutes_from_row(row) -> int:
+    minutes = safe_int(row_value(row, "interval_minutes", 0), 0)
+    if minutes > 0:
+        return minutes
+    return max(1, safe_int(row["interval_hours"], 1)) * 60
+
+
+def interval_label(minutes: int) -> str:
+    minutes = int(minutes)
+    if minutes < 60:
+        return f"a cada {minutes} min"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"a cada {hours}h"
+    hours = minutes // 60
+    rest = minutes % 60
+    return f"a cada {hours}h{rest:02d}min"
 
 
 # Notificações privadas para o dono.
@@ -405,6 +468,15 @@ class Database:
                     button2_text TEXT DEFAULT '',
                     button2_url TEXT DEFAULT '',
                     button2_style TEXT DEFAULT '',
+                    button3_text TEXT DEFAULT '',
+                    button3_url TEXT DEFAULT '',
+                    button3_style TEXT DEFAULT '',
+                    button4_text TEXT DEFAULT '',
+                    button4_url TEXT DEFAULT '',
+                    button4_style TEXT DEFAULT '',
+                    button5_text TEXT DEFAULT '',
+                    button5_url TEXT DEFAULT '',
+                    button5_style TEXT DEFAULT '',
                     pin_message INTEGER DEFAULT 1,
                     delete_previous INTEGER DEFAULT 1,
                     active INTEGER DEFAULT 1,
@@ -451,6 +523,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ad_id INTEGER NOT NULL,
                     interval_hours INTEGER NOT NULL,
+                    interval_minutes INTEGER DEFAULT 0,
                     active INTEGER DEFAULT 1,
                     created_at TEXT,
                     updated_at TEXT,
@@ -494,13 +567,24 @@ class Database:
                 """
             )
 
-            # Migração segura para versões antigas do banco: adiciona suporte a 2 botões URL e cor nos botões.
+            # Migração segura para versões antigas do banco: adiciona suporte a entities,
+            # até 5 botões URL coloridos e intervalos em minutos.
             for column_sql in (
                 "ALTER TABLE ads ADD COLUMN description_entities TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button_style TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button2_text TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button2_url TEXT DEFAULT ''",
                 "ALTER TABLE ads ADD COLUMN button2_style TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button3_text TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button3_url TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button3_style TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button4_text TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button4_url TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button4_style TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button5_text TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button5_url TEXT DEFAULT ''",
+                "ALTER TABLE ads ADD COLUMN button5_style TEXT DEFAULT ''",
+                "ALTER TABLE interval_schedules ADD COLUMN interval_minutes INTEGER DEFAULT 0",
             ):
                 try:
                     cur.execute(column_sql)
@@ -559,10 +643,14 @@ class Database:
                 """
                 INSERT INTO ads (
                     title, media_type, media_file_id, description, description_entities,
-                    button_text, button_url, button_style, button2_text, button2_url, button2_style,
+                    button_text, button_url, button_style,
+                    button2_text, button2_url, button2_style,
+                    button3_text, button3_url, button3_style,
+                    button4_text, button4_url, button4_style,
+                    button5_text, button5_url, button5_style,
                     pin_message, delete_previous, active, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     data["title"],
@@ -576,6 +664,15 @@ class Database:
                     data.get("button2_text") or "",
                     data.get("button2_url") or "",
                     normalize_button_style(data.get("button2_style") or ""),
+                    data.get("button3_text") or "",
+                    data.get("button3_url") or "",
+                    normalize_button_style(data.get("button3_style") or ""),
+                    data.get("button4_text") or "",
+                    data.get("button4_url") or "",
+                    normalize_button_style(data.get("button4_style") or ""),
+                    data.get("button5_text") or "",
+                    data.get("button5_url") or "",
+                    normalize_button_style(data.get("button5_style") or ""),
                     int(data.get("pin_message", 1)),
                     int(data.get("delete_previous", 1)),
                     now_iso(),
@@ -598,6 +695,15 @@ class Database:
             "button2_text",
             "button2_url",
             "button2_style",
+            "button3_text",
+            "button3_url",
+            "button3_style",
+            "button4_text",
+            "button4_url",
+            "button4_style",
+            "button5_text",
+            "button5_url",
+            "button5_style",
             "pin_message",
             "delete_previous",
             "active",
@@ -615,7 +721,7 @@ class Database:
         with self.conn() as con:
             return con.execute("SELECT * FROM ads WHERE id=?", (ad_id,)).fetchone()
 
-    def list_ads(self, active_only: bool = False, limit: int = 20, offset: int = 0):
+    def list_ads(self, active_only: bool = False, limit: int = 100, offset: int = 0):
         with self.conn() as con:
             where = "WHERE active=1" if active_only else ""
             return con.execute(
@@ -746,19 +852,20 @@ class Database:
             ).fetchone()["c"]
 
     # ---------- Interval schedules ----------
-    def create_interval_schedule(self, ad_id: int, interval_hours: int) -> int:
-        interval_hours = int(interval_hours)
-        if interval_hours < 1 or interval_hours > 24:
-            raise ValueError("Intervalo inválido. Use de 1 a 24 horas.")
+    def create_interval_schedule(self, ad_id: int, interval_minutes: int) -> int:
+        interval_minutes = int(interval_minutes)
+        if interval_minutes < 5 or interval_minutes > 24 * 60:
+            raise ValueError("Intervalo inválido. Use de 5 minutos até 24 horas.")
+        interval_hours_compat = max(1, round(interval_minutes / 60))
         with self.conn() as con:
             cur = con.execute(
                 """
                 INSERT INTO interval_schedules (
-                    ad_id, interval_hours, active, created_at, updated_at, last_run_at
+                    ad_id, interval_hours, interval_minutes, active, created_at, updated_at, last_run_at
                 )
-                VALUES (?, ?, 1, ?, ?, NULL)
+                VALUES (?, ?, ?, 1, ?, ?, NULL)
                 """,
-                (ad_id, interval_hours, now_iso(), now_iso()),
+                (ad_id, interval_hours_compat, interval_minutes, now_iso(), now_iso()),
             )
             con.commit()
             return int(cur.lastrowid)
@@ -960,37 +1067,28 @@ def ad_edit_keyboard(ad):
     delete = "✅ Apagar anterior" if ad["delete_previous"] else "❌ Apagar anterior"
     active = "✅ Ativo" if ad["active"] else "❌ Desativado"
     ad_id = ad["id"]
-    return InlineKeyboardMarkup(
+    rows = [
         [
-            [
-                InlineKeyboardButton("Título", callback_data=f"ad:editfield:{ad_id}:title"),
-                InlineKeyboardButton("Descrição", callback_data=f"ad:editfield:{ad_id}:description"),
-            ],
-            [
-                InlineKeyboardButton("Mídia", callback_data=f"ad:editmedia:{ad_id}"),
-                InlineKeyboardButton("Botão 1", callback_data=f"ad:editfield:{ad_id}:button_text"),
-            ],
-            [
-                InlineKeyboardButton("URL 1", callback_data=f"ad:editfield:{ad_id}:button_url"),
-                InlineKeyboardButton("Botão 2", callback_data=f"ad:editfield:{ad_id}:button2_text"),
-            ],
-            [
-                InlineKeyboardButton("Cor 1", callback_data=f"ad:editfield:{ad_id}:button_style"),
-                InlineKeyboardButton("URL 2", callback_data=f"ad:editfield:{ad_id}:button2_url"),
-            ],
-            [
-                InlineKeyboardButton("Cor 2", callback_data=f"ad:editfield:{ad_id}:button2_style"),
-            ],
-            [
-                InlineKeyboardButton(pin, callback_data=f"ad:togglepin:{ad_id}"),
-                InlineKeyboardButton(delete, callback_data=f"ad:toggledel:{ad_id}"),
-            ],
-            [
-                InlineKeyboardButton(active, callback_data=f"ad:toggleactive:{ad_id}"),
-            ],
-            [InlineKeyboardButton("⬅️ Voltar", callback_data=f"ad:view:{ad_id}")],
-        ]
-    )
+            InlineKeyboardButton("Título", callback_data=f"ad:editfield:{ad_id}:title"),
+            InlineKeyboardButton("Descrição", callback_data=f"ad:editfield:{ad_id}:description"),
+        ],
+        [InlineKeyboardButton("Mídia", callback_data=f"ad:editmedia:{ad_id}")],
+    ]
+    for n in range(1, MAX_URL_BUTTONS + 1):
+        rows.append([
+            InlineKeyboardButton(f"Botão {n}", callback_data=f"ad:editfield:{ad_id}:{button_field(n, 'text')}"),
+            InlineKeyboardButton(f"URL {n}", callback_data=f"ad:editfield:{ad_id}:{button_field(n, 'url')}"),
+            InlineKeyboardButton(f"Cor {n}", callback_data=f"ad:editfield:{ad_id}:{button_field(n, 'style')}"),
+        ])
+    rows.extend([
+        [
+            InlineKeyboardButton(pin, callback_data=f"ad:togglepin:{ad_id}"),
+            InlineKeyboardButton(delete, callback_data=f"ad:toggledel:{ad_id}"),
+        ],
+        [InlineKeyboardButton(active, callback_data=f"ad:toggleactive:{ad_id}")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data=f"ad:view:{ad_id}")],
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
@@ -1037,17 +1135,27 @@ async def require_admin_query(query) -> bool:
 
 
 def ad_text(ad) -> str:
-    return (
-        f"📌 Anúncio #{ad['id']}\n\n"
-        f"Nome: {ad['title']}\n"
-        f"Mídia: {ad['media_type']}\n"
-        f"Botão 1: {ad['button_text'] or 'sem botão'} | Cor: {button_style_name(ad['button_style'] if 'button_style' in ad.keys() else '')}\n"
-        f"Botão 2: {ad['button2_text'] or 'sem botão'} | Cor: {button_style_name(ad['button2_style'] if 'button2_style' in ad.keys() else '')}\n"
-        f"Fixar: {'sim' if ad['pin_message'] else 'não'}\n"
-        f"Apagar anterior: {'sim' if ad['delete_previous'] else 'não'}\n"
-        f"Status: {'ativo' if ad['active'] else 'desativado'}\n\n"
-        f"Descrição:\n{ad['description']}"
-    )
+    lines = [
+        f"📌 Anúncio #{ad['id']}",
+        "",
+        f"Nome: {ad['title']}",
+        f"Mídia: {ad['media_type']}",
+    ]
+    for n in range(1, MAX_URL_BUTTONS + 1):
+        text = button_value(ad, n, "text")
+        style = button_style_name(button_value(ad, n, "style"))
+        if text:
+            lines.append(f"Botão {n}: {text} | Cor: {style}")
+    if not any(button_value(ad, n, "text") for n in range(1, MAX_URL_BUTTONS + 1)):
+        lines.append("Botões: sem botão")
+    lines.extend([
+        f"Fixar: {'sim' if ad['pin_message'] else 'não'}",
+        f"Apagar anterior: {'sim' if ad['delete_previous'] else 'não'}",
+        f"Status: {'ativo' if ad['active'] else 'desativado'}",
+        "",
+        f"Descrição:\n{ad['description']}",
+    ])
+    return "\n".join(lines)
 
 
 async def send_ad_to_chat(bot, chat_id: int, ad, *, preview=False) -> tuple[bool, str, int | None]:
@@ -1058,17 +1166,12 @@ async def send_ad_to_chat(bot, chat_id: int, ad, *, preview=False) -> tuple[bool
     reply_markup = None
     buttons = []
 
-    button_text = (ad["button_text"] or "").strip()
-    button_url = normalize_url(ad["button_url"] or "")
-    if button_text and button_url and is_valid_url(button_url):
-        button_style = ad["button_style"] if "button_style" in ad.keys() else ""
-        buttons.append([url_button(button_text, button_url, button_style)])
-
-    button2_text = (ad["button2_text"] or "").strip() if "button2_text" in ad.keys() else ""
-    button2_url = normalize_url(ad["button2_url"] or "") if "button2_url" in ad.keys() else ""
-    if button2_text and button2_url and is_valid_url(button2_url):
-        button2_style = ad["button2_style"] if "button2_style" in ad.keys() else ""
-        buttons.append([url_button(button2_text, button2_url, button2_style)])
+    for n in range(1, MAX_URL_BUTTONS + 1):
+        button_text = button_value(ad, n, "text").strip()
+        button_url = normalize_url(button_value(ad, n, "url"))
+        if button_text and button_url and is_valid_url(button_url):
+            button_style = button_value(ad, n, "style")
+            buttons.append([url_button(button_text, button_url, button_style)])
 
     if buttons:
         reply_markup = InlineKeyboardMarkup(buttons)
@@ -1220,8 +1323,8 @@ def schedule_interval_job(application: Application, interval_row):
     for job in application.job_queue.get_jobs_by_name(name):
         job.schedule_removal()
 
-    interval_hours = int(interval_row["interval_hours"])
-    interval_seconds = interval_hours * 60 * 60
+    interval_minutes = interval_minutes_from_row(interval_row)
+    interval_seconds = interval_minutes * 60
 
     application.job_queue.run_repeating(
         interval_post_job,
@@ -1232,9 +1335,9 @@ def schedule_interval_job(application: Application, interval_row):
     )
 
     logger.info(
-        "Postagem automática carregada: %s a cada %sh",
+        "Postagem automática carregada: %s %s",
         name,
-        interval_hours,
+        interval_label(interval_minutes),
     )
 
 
@@ -1295,10 +1398,10 @@ async def interval_post_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(
-        "Executando postagem automática #%s do anúncio #%s a cada %sh",
+        "Executando postagem automática #%s do anúncio #%s %s",
         interval_id,
         ad["id"],
-        interval["interval_hours"],
+        interval_label(interval_minutes_from_row(interval)),
     )
     result = await post_ad_to_all(context.bot, ad)
     db.mark_interval_ran(interval_id)
@@ -1310,7 +1413,7 @@ async def interval_post_job(context: ContextTypes.DEFAULT_TYPE):
                 text=(
                     f"🔁 Postagem automática executada\n\n"
                     f"Anúncio: #{ad['id']} - {ad['title']}\n"
-                    f"Intervalo: a cada {interval['interval_hours']}h\n"
+                    f"Intervalo: {interval_label(interval_minutes_from_row(interval))}\n"
                     f"Destinos: {result['total']}\n"
                     f"Enviados: {result['success']}\n"
                     f"Falhas: {result['error']}"
@@ -1696,7 +1799,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 flow["step"] = "button_text"
                 await msg.reply_text(
                     "Mídia e legenda recebidas ✅\n\n"
-                    "Agora envie o texto do botão 1, ou envie: sem botão"
+                    "Agora envie o texto do botão 1, ou envie: sem botão. Você pode adicionar até 5 botões URL."
                 )
                 return
 
@@ -1721,7 +1824,7 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 flow["step"] = "button_text"
                 await msg.reply_text(
                     "Vídeo e legenda recebidos ✅\n\n"
-                    "Agora envie o texto do botão 1, ou envie: sem botão"
+                    "Agora envie o texto do botão 1, ou envie: sem botão. Você pode adicionar até 5 botões URL."
                 )
                 return
 
@@ -1745,7 +1848,8 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
             flow["step"] = "button_text"
             await msg.reply_text(
                 "Texto do anúncio recebido ✅\n\n"
-                "Agora envie o texto do botão.\n\n"
+                "Agora envie o texto do botão 1.\n\n"
+            "Você pode adicionar até 5 botões URL neste anúncio.\n\n"
                 "Exemplos:\n"
                 "Ver modelo\n"
                 "Entrar no VIP\n"
@@ -1768,7 +1872,8 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         data["description"], data["description_entities"] = rich_text_payload(msg)
         flow["step"] = "button_text"
         await msg.reply_text(
-            "Agora envie o texto do botão.\n\n"
+            "Agora envie o texto do botão 1.\n\n"
+            "Você pode adicionar até 5 botões URL neste anúncio.\n\n"
             "Exemplos:\n"
             "Ver modelo\n"
             "Entrar no VIP\n"
@@ -1777,104 +1882,64 @@ async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         return
 
-    if step == "button_text":
+    button_step_match = re.match(r"^button(?:(\d+))?_(text|url|style)$", step or "")
+    if button_step_match:
+        number = int(button_step_match.group(1) or 1)
+        part = button_step_match.group(2)
         text = (msg.text or "").strip()
-        if not text:
-            await msg.reply_text("Envie o texto do botão 1 ou 'sem botão'.")
+
+        if part == "text":
+            if not text:
+                await msg.reply_text(f"Envie o texto do botão {number} ou 'sem botão'.")
+                return
+
+            if is_skip_button_text(text, number):
+                clear_buttons_from(data, number)
+                flow["step"] = "pin"
+                await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
+                return
+
+            data[button_field(number, "text")] = text[:50]
+            flow["step"] = f"button{number}_url" if number > 1 else "button_url"
+            await msg.reply_text(
+                f"Agora envie o link do botão {number}.\n\n"
+                "Exemplo:\n"
+                "https://t.me/seulink\n"
+                "https://sxyprime.com"
+            )
             return
 
-        if text.lower() in {"sem botão", "sem botao", "pular", "não", "nao"}:
-            data["button_text"] = ""
-            data["button_url"] = ""
-            data["button_style"] = ""
-            data["button2_text"] = ""
-            data["button2_url"] = ""
-            data["button2_style"] = ""
+        if part == "url":
+            url = normalize_url(text)
+            if not is_valid_url(url):
+                await msg.reply_text("Link inválido. Envie um link começando com https:// ou http://")
+                return
+
+            data[button_field(number, "url")] = url
+            flow["step"] = f"button{number}_style" if number > 1 else "button_style"
+            await msg.reply_text(style_help_text(number))
+            return
+
+        if part == "style":
+            style = normalize_button_style(text)
+            if text.lower() and text.lower() not in BUTTON_STYLE_ALIASES:
+                await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
+                return
+            data[button_field(number, "style")] = style
+
+            next_number = number + 1
+            if next_number <= MAX_URL_BUTTONS:
+                flow["step"] = f"button{next_number}_text"
+                await msg.reply_text(
+                    f"Quer adicionar o botão URL {next_number}?\n\n"
+                    f"Envie o texto do botão {next_number}. Exemplo: Falar no suporte\n"
+                    "Ou envie: sem botão"
+                )
+                return
+
             flow["step"] = "pin"
             await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
             return
-
-        data["button_text"] = text[:50]
-        flow["step"] = "button_url"
-        await msg.reply_text(
-            "Agora envie o link do botão 1.\n\n"
-            "Exemplo:\n"
-            "https://t.me/seulink\n"
-            "https://sxyprime.com"
-        )
-        return
-
-    if step == "button_url":
-        url = normalize_url((msg.text or "").strip())
-        if not is_valid_url(url):
-            await msg.reply_text("Link inválido. Envie um link começando com https:// ou http://")
-            return
-
-        data["button_url"] = url
-        flow["step"] = "button_style"
-        await msg.reply_text(style_help_text(1))
-        return
-
-    if step == "button_style":
-        style = normalize_button_style((msg.text or "").strip())
-        text = (msg.text or "").strip().lower()
-        if text and text not in BUTTON_STYLE_ALIASES:
-            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
-            return
-        data["button_style"] = style
-        flow["step"] = "button2_text"
-        await msg.reply_text(
-            "Quer adicionar um segundo botão URL?\n\n"
-            "Envie o texto do botão 2. Exemplo: Falar no suporte\n"
-            "Ou envie: sem segundo botão"
-        )
-        return
-
-    if step == "button2_text":
-        text = (msg.text or "").strip()
-        if not text:
-            await msg.reply_text("Envie o texto do botão 2 ou 'sem segundo botão'.")
-            return
-
-        if text.lower() in {"sem segundo botão", "sem segundo botao", "sem botão", "sem botao", "pular", "não", "nao"}:
-            data["button2_text"] = ""
-            data["button2_url"] = ""
-            data["button2_style"] = ""
-            flow["step"] = "pin"
-            await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
-            return
-
-        data["button2_text"] = text[:50]
-        flow["step"] = "button2_url"
-        await msg.reply_text(
-            "Agora envie o link do botão 2.\n\n"
-            "Exemplo:\n"
-            "https://t.me/seusupoorte\n"
-            "https://sxyprime.com"
-        )
-        return
-
-    if step == "button2_url":
-        url = normalize_url((msg.text or "").strip())
-        if not is_valid_url(url):
-            await msg.reply_text("Link inválido. Envie um link começando com https:// ou http://")
-            return
-
-        data["button2_url"] = url
-        flow["step"] = "button2_style"
-        await msg.reply_text(style_help_text(2))
-        return
-
-    if step == "button2_style":
-        style = normalize_button_style((msg.text or "").strip())
-        text = (msg.text or "").strip().lower()
-        if text and text not in BUTTON_STYLE_ALIASES:
-            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
-            return
-        data["button2_style"] = style
-        flow["step"] = "pin"
-        await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
-        return
 
 
 async def handle_schedule_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: dict):
@@ -1956,8 +2021,8 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     text = visible_text(msg)
-    button_text_fields = {"button_text", "button2_text"}
-    button_style_fields = {"button_style", "button2_style"}
+    button_text_fields = {button_field(n, "text") for n in range(1, MAX_URL_BUTTONS + 1)}
+    button_style_fields = {button_field(n, "style") for n in range(1, MAX_URL_BUTTONS + 1)}
     if not text and field not in button_text_fields and field not in button_style_fields:
         await msg.reply_text("Envie um texto válido.")
         return
@@ -1972,56 +2037,36 @@ async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         desc_value, entities_value = rich_text_payload(msg)
         db.update_ad_field(ad_id, "description", desc_value)
         db.update_ad_field(ad_id, "description_entities", entities_value)
-    elif field == "button_text":
-        if text.lower() in {"sem botão", "sem botao", "pular", "remover"}:
-            db.update_ad_field(ad_id, "button_text", "")
-            db.update_ad_field(ad_id, "button_url", "")
-            db.update_ad_field(ad_id, "button_style", "")
-        else:
-            db.update_ad_field(ad_id, "button_text", text[:50])
-    elif field == "button_url":
-        url = normalize_url(text)
-        if text.lower() in {"remover", "pular", "sem botão", "sem botao"}:
-            db.update_ad_field(ad_id, "button_url", "")
-            db.update_ad_field(ad_id, "button_style", "")
-        elif not is_valid_url(url):
-            await msg.reply_text("URL inválida. Envie começando com https:// ou http://")
-            return
-        else:
-            db.update_ad_field(ad_id, "button_url", url)
-    elif field == "button_style":
-        if text.lower() in {"remover", "pular", "sem cor", "sem botão", "sem botao"}:
-            db.update_ad_field(ad_id, "button_style", "")
-        elif text.lower() not in BUTTON_STYLE_ALIASES:
-            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
-            return
-        else:
-            db.update_ad_field(ad_id, "button_style", normalize_button_style(text))
-    elif field == "button2_text":
-        if text.lower() in {"sem segundo botão", "sem segundo botao", "sem botão", "sem botao", "pular", "remover"}:
-            db.update_ad_field(ad_id, "button2_text", "")
-            db.update_ad_field(ad_id, "button2_url", "")
-            db.update_ad_field(ad_id, "button2_style", "")
-        else:
-            db.update_ad_field(ad_id, "button2_text", text[:50])
-    elif field == "button2_url":
-        url = normalize_url(text)
-        if text.lower() in {"remover", "pular", "sem botão", "sem botao", "sem segundo botão", "sem segundo botao"}:
-            db.update_ad_field(ad_id, "button2_url", "")
-            db.update_ad_field(ad_id, "button2_style", "")
-        elif not is_valid_url(url):
-            await msg.reply_text("URL inválida. Envie começando com https:// ou http://")
-            return
-        else:
-            db.update_ad_field(ad_id, "button2_url", url)
-    elif field == "button2_style":
-        if text.lower() in {"remover", "pular", "sem cor", "sem botão", "sem botao", "sem segundo botão", "sem segundo botao"}:
-            db.update_ad_field(ad_id, "button2_style", "")
-        elif text.lower() not in BUTTON_STYLE_ALIASES:
-            await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
-            return
-        else:
-            db.update_ad_field(ad_id, "button2_style", normalize_button_style(text))
+    elif re.match(r"^button(?:(\d+))?_(text|url|style)$", field or ""):
+        match = re.match(r"^button(?:(\d+))?_(text|url|style)$", field)
+        number = int(match.group(1) or 1)
+        part = match.group(2)
+
+        if part == "text":
+            if is_skip_button_text(text, number):
+                db.update_ad_field(ad_id, button_field(number, "text"), "")
+                db.update_ad_field(ad_id, button_field(number, "url"), "")
+                db.update_ad_field(ad_id, button_field(number, "style"), "")
+            else:
+                db.update_ad_field(ad_id, button_field(number, "text"), text[:50])
+        elif part == "url":
+            url = normalize_url(text)
+            if text.lower() in {"remover", "pular", "sem botão", "sem botao", "sem url"}:
+                db.update_ad_field(ad_id, button_field(number, "url"), "")
+                db.update_ad_field(ad_id, button_field(number, "style"), "")
+            elif not is_valid_url(url):
+                await msg.reply_text("URL inválida. Envie começando com https:// ou http://")
+                return
+            else:
+                db.update_ad_field(ad_id, button_field(number, "url"), url)
+        elif part == "style":
+            if text.lower() in {"remover", "pular", "sem cor", "sem botão", "sem botao", "padrão", "padrao", "normal"}:
+                db.update_ad_field(ad_id, button_field(number, "style"), "")
+            elif text.lower() not in BUTTON_STYLE_ALIASES:
+                await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
+                return
+            else:
+                db.update_ad_field(ad_id, button_field(number, "style"), normalize_button_style(text))
 
     context.user_data.clear()
     await msg.reply_text("✅ Anúncio atualizado.", reply_markup=ad_keyboard(ad_id))
@@ -2105,7 +2150,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "ad:list":
-        ads = db.list_ads(limit=20)
+        ads = db.list_ads(limit=100)
         if not ads:
             await safe_edit(query, "Nenhum anúncio criado ainda.", reply_markup=back_home())
             return
@@ -2218,21 +2263,31 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query,
             f"🔁 Postagem automática do anúncio #{ad_id}\n\n"
             "Escolha de quanto em quanto tempo o bot deve postar este anúncio.\n\n"
-            "Importante: ao ativar, a primeira postagem automática acontece depois do intervalo escolhido. "
+            "Pode deixar vários anúncios diferentes rodando ao mesmo tempo. "
+            "Ao ativar aqui, o bot só substitui o automático antigo deste mesmo anúncio.\n\n"
+            "Importante: a primeira postagem automática acontece depois do intervalo escolhido. "
             "Se quiser postar agora, use o botão 🚀 Postar agora.",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("1 em 1 hora", callback_data=f"interval:create:{ad_id}:1"),
-                        InlineKeyboardButton("2 em 2 horas", callback_data=f"interval:create:{ad_id}:2"),
+                        InlineKeyboardButton("5 min", callback_data=f"interval:create:{ad_id}:m:5"),
+                        InlineKeyboardButton("10 min", callback_data=f"interval:create:{ad_id}:m:10"),
+                        InlineKeyboardButton("15 min", callback_data=f"interval:create:{ad_id}:m:15"),
                     ],
                     [
-                        InlineKeyboardButton("3 em 3 horas", callback_data=f"interval:create:{ad_id}:3"),
-                        InlineKeyboardButton("4 em 4 horas", callback_data=f"interval:create:{ad_id}:4"),
+                        InlineKeyboardButton("20 min", callback_data=f"interval:create:{ad_id}:m:20"),
+                        InlineKeyboardButton("25 min", callback_data=f"interval:create:{ad_id}:m:25"),
+                        InlineKeyboardButton("30 min", callback_data=f"interval:create:{ad_id}:m:30"),
                     ],
                     [
-                        InlineKeyboardButton("6 em 6 horas", callback_data=f"interval:create:{ad_id}:6"),
-                        InlineKeyboardButton("12 em 12 horas", callback_data=f"interval:create:{ad_id}:12"),
+                        InlineKeyboardButton("1h", callback_data=f"interval:create:{ad_id}:h:1"),
+                        InlineKeyboardButton("2h", callback_data=f"interval:create:{ad_id}:h:2"),
+                        InlineKeyboardButton("3h", callback_data=f"interval:create:{ad_id}:h:3"),
+                    ],
+                    [
+                        InlineKeyboardButton("4h", callback_data=f"interval:create:{ad_id}:h:4"),
+                        InlineKeyboardButton("6h", callback_data=f"interval:create:{ad_id}:h:6"),
+                        InlineKeyboardButton("12h", callback_data=f"interval:create:{ad_id}:h:12"),
                     ],
                     [InlineKeyboardButton("⬅️ Voltar", callback_data=f"ad:view:{ad_id}")],
                 ]
@@ -2243,7 +2298,14 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("interval:create:"):
         parts = data.split(":")
         ad_id = int(parts[2])
-        interval_hours = int(parts[3])
+        # Compatibilidade com callback antigo: interval:create:<ad_id>:3 = 3 horas
+        if len(parts) >= 5 and parts[3] == "m":
+            interval_minutes = int(parts[4])
+        elif len(parts) >= 5 and parts[3] == "h":
+            interval_minutes = int(parts[4]) * 60
+        else:
+            interval_minutes = int(parts[3]) * 60
+
         ad = db.get_ad(ad_id)
         if not ad:
             await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
@@ -2253,7 +2315,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for old_interval_id in old_interval_ids:
             remove_interval_job(context.application, old_interval_id)
 
-        interval_id = db.create_interval_schedule(ad_id, interval_hours)
+        interval_id = db.create_interval_schedule(ad_id, interval_minutes)
         interval = db.get_interval_schedule(interval_id)
         schedule_interval_job(context.application, interval)
 
@@ -2261,8 +2323,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query,
             f"✅ Postagem automática ativada.\n\n"
             f"Anúncio: #{ad_id} - {ad['title']}\n"
-            f"Intervalo: a cada {interval_hours} hora(s)\n\n"
-            "O bot vai postar nos destinos aprovados ativos. "
+            f"Intervalo: {interval_label(interval_minutes)}\n\n"
+            "Você pode ativar outros anúncios também. O bot vai postar todos os automáticos ativos nos destinos aprovados.\n"
             "A primeira postagem automática acontece depois desse intervalo.",
             reply_markup=ad_keyboard(ad_id),
         )
@@ -2285,13 +2347,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         labels = {
             "title": "novo título",
             "description": "nova descrição",
-            "button_text": "novo texto do botão 1. Envie 'remover' para tirar o botão 1",
-            "button_url": "nova URL do botão 1. Envie 'remover' para tirar a URL 1",
-            "button_style": "cor do botão 1: padrão, azul, verde ou vermelho. Envie 'remover' para voltar ao padrão",
-            "button2_text": "novo texto do botão 2. Envie 'remover' para tirar o botão 2",
-            "button2_url": "nova URL do botão 2. Envie 'remover' para tirar a URL 2",
-            "button2_style": "cor do botão 2: padrão, azul, verde ou vermelho. Envie 'remover' para voltar ao padrão",
         }
+        for n in range(1, MAX_URL_BUTTONS + 1):
+            labels[button_field(n, "text")] = f"novo texto do botão {n}. Envie 'remover' para tirar o botão {n}"
+            labels[button_field(n, "url")] = f"nova URL do botão {n}. Envie 'remover' para tirar a URL {n}"
+            labels[button_field(n, "style")] = f"cor do botão {n}: padrão, azul, verde ou vermelho. Envie 'remover' para voltar ao padrão"
 
         context.user_data["flow"] = {"name": "edit_ad", "ad_id": ad_id, "field": field}
         await safe_edit(
@@ -2485,7 +2545,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = "✅" if i["active"] else "❌"
             last_run = i["last_run_at"] or "ainda não executou"
             text += (
-                f"{status} #{i['id']} - a cada {i['interval_hours']}h\n"
+                f"{status} #{i['id']} - {interval_label(interval_minutes_from_row(i))}\n"
                 f"Anúncio: #{i['ad_id']} - {i['ad_title'] or 'removido'}\n"
                 f"Última execução: {last_run}\n\n"
             )
