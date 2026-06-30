@@ -15,6 +15,7 @@ Bot de anúncios para a Agência Sexy Prime com painel pelo Telegram, mídia ou 
 - Agendar por horário
 - Postagem automática por intervalo: 5, 10, 15, 20, 25 e 30 minutos, além de 1h, 2h, 3h, 4h, 6h e 12h
 - Vários anúncios automáticos ativos ao mesmo tempo
+- Remover anúncio agora exclui de vez do painel e apaga agendamentos/automáticos ligados a ele
 - Fixar anúncio automaticamente
 - Apagar postagem anterior do bot
 - Aprovar/rejeitar grupos e canais

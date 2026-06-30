@@ -733,6 +733,40 @@ class Database:
         with self.conn() as con:
             return con.execute("SELECT COUNT(*) AS c FROM ads").fetchone()["c"]
 
+    def delete_ad_hard(self, ad_id: int) -> dict:
+        """Exclui o anúncio do banco e remove agendamentos ligados a ele.
+
+        Mantém post_logs/last_posts para histórico e para o recurso de apagar
+        a postagem anterior continuar funcionando no próximo anúncio.
+        """
+        with self.conn() as con:
+            ad = con.execute("SELECT id, title FROM ads WHERE id=?", (ad_id,)).fetchone()
+            if not ad:
+                return {"deleted": False, "schedule_ids": [], "interval_ids": []}
+
+            schedule_rows = con.execute(
+                "SELECT id FROM schedules WHERE ad_id=?",
+                (ad_id,),
+            ).fetchall()
+            interval_rows = con.execute(
+                "SELECT id FROM interval_schedules WHERE ad_id=?",
+                (ad_id,),
+            ).fetchall()
+            schedule_ids = [int(r["id"]) for r in schedule_rows]
+            interval_ids = [int(r["id"]) for r in interval_rows]
+
+            con.execute("DELETE FROM schedules WHERE ad_id=?", (ad_id,))
+            con.execute("DELETE FROM interval_schedules WHERE ad_id=?", (ad_id,))
+            con.execute("DELETE FROM ads WHERE id=?", (ad_id,))
+            con.commit()
+
+            return {
+                "deleted": True,
+                "title": ad["title"],
+                "schedule_ids": schedule_ids,
+                "interval_ids": interval_ids,
+            }
+
     # ---------- Targets ----------
     def upsert_target(self, chat_id: int, title: str, chat_type: str, can_pin: bool):
         with self.conn() as con:
@@ -2412,10 +2446,14 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await safe_edit(
             query,
-            f"🗑 Deseja remover/desativar o anúncio #{ad_id}?\n\n{ad['title']}",
+            (
+                f"🗑 Deseja excluir definitivamente o anúncio #{ad_id}?\n\n"
+                f"{ad['title']}\n\n"
+                "Isso remove o anúncio do painel e apaga os agendamentos/automáticos ligados a ele."
+            ),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("✅ Sim, remover", callback_data=f"ad:deleteconfirm:{ad_id}")],
+                    [InlineKeyboardButton("✅ Sim, excluir de vez", callback_data=f"ad:deleteconfirm:{ad_id}")],
                     [InlineKeyboardButton("⬅️ Cancelar", callback_data=f"ad:view:{ad_id}")],
                 ]
             ),
@@ -2424,8 +2462,25 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("ad:deleteconfirm:"):
         ad_id = int(data.split(":")[-1])
-        db.update_ad_field(ad_id, "active", 0)
-        await safe_edit(query, f"✅ Anúncio #{ad_id} desativado.", reply_markup=back_home())
+        result = db.delete_ad_hard(ad_id)
+        if not result.get("deleted"):
+            await safe_edit(query, "Anúncio não encontrado ou já excluído.", reply_markup=back_home())
+            return
+
+        for schedule_id in result.get("schedule_ids", []):
+            remove_schedule_job(context.application, schedule_id)
+        for interval_id in result.get("interval_ids", []):
+            remove_interval_job(context.application, interval_id)
+
+        await safe_edit(
+            query,
+            (
+                f"✅ Anúncio #{ad_id} excluído de vez.\n\n"
+                f"Agendamentos removidos: {len(result.get('schedule_ids', []))}\n"
+                f"Automáticos removidos: {len(result.get('interval_ids', []))}"
+            ),
+            reply_markup=back_home(),
+        )
         return
 
     # ---------- targets ----------
