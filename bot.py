@@ -1,28 +1,20 @@
-import os
-import re
-import json
-import sqlite3
-import logging
+from __future__ import annotations
+
 import asyncio
+import json
+import logging
+import os
 import secrets
-from datetime import datetime, time
+import sqlite3
+import tempfile
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from typing import Any
+from urllib.parse import urlparse
 
+import aiohttp
 from dotenv import load_dotenv
-from aiohttp import web
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    MessageEntity,
-    BotCommandScopeDefault,
-    BotCommandScopeAllPrivateChats,
-    BotCommandScopeAllGroupChats,
-    BotCommandScopeAllChatAdministrators,
-)
-from telegram.constants import ChatMemberStatus, ParseMode
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -31,2872 +23,768 @@ from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
-    Defaults,
     MessageHandler,
     filters,
 )
-
-# ============================================================
-# Sexy Prime Ads Bot
-# Bot de anúncios com mídia, botão URL, agendamento, fixação,
-# controle por dono/admin e destinos aprovados.
-# ============================================================
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
-AGENCY_NAME = os.getenv("AGENCY_NAME", "Sexy Prime").strip()
-SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/SXP_suporte").strip()
-TIMEZONE_NAME = os.getenv("TIMEZONE", "America/Sao_Paulo").strip()
-DB_PATH = os.getenv("DB_PATH", "data/sexy_prime_ads.db").strip()
-
-# Limites do bot
-MAX_URL_BUTTONS = 5
-MINUTE_INTERVAL_OPTIONS = [5, 10, 15, 20, 25, 30]
-HOUR_INTERVAL_OPTIONS = [1, 2, 3, 4, 6, 12]
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    if not value:
-        return default
-    return value in {"1", "true", "yes", "sim", "on", "ativo"}
-
-
-# Estilos oficiais do Telegram para botões.
-# vazio = padrão do app; primary = azul; success = verde; danger = vermelho.
-BUTTON_STYLE_ALIASES = {
-    "": "",
-    "padrao": "",
-    "padrão": "",
-    "normal": "",
-    "default": "",
-    "sem cor": "",
-    "azul": "primary",
-    "blue": "primary",
-    "primary": "primary",
-    "primario": "primary",
-    "primário": "primary",
-    "verde": "success",
-    "green": "success",
-    "success": "success",
-    "sucesso": "success",
-    "vermelho": "danger",
-    "red": "danger",
-    "danger": "danger",
-    "perigo": "danger",
-}
-
-BUTTON_STYLE_NAMES = {
-    "": "padrão",
-    "primary": "azul",
-    "success": "verde",
-    "danger": "vermelho",
-}
-
-
-def normalize_button_style(value: str | None) -> str:
-    value = (value or "").strip().lower()
-    return BUTTON_STYLE_ALIASES.get(value, "")
-
-
-def button_style_name(value: str | None) -> str:
-    return BUTTON_STYLE_NAMES.get((value or "").strip(), "padrão")
-
-
-def style_help_text(button_number: int) -> str:
-    return (
-        f"Agora escolha a cor do botão {button_number}.\n\n"
-        "Envie uma dessas opções:\n"
-        "padrão\n"
-        "azul\n"
-        "verde\n"
-        "vermelho"
-    )
-
-
-def url_button(text: str, url: str, style: str | None = "") -> InlineKeyboardButton:
-    style = normalize_button_style(style)
-    if style:
-        # api_kwargs envia o campo novo mesmo se a biblioteca ainda não expor style diretamente.
-        return InlineKeyboardButton(text, url=url, api_kwargs={"style": style})
-    return InlineKeyboardButton(text, url=url)
-
-
-def button_field(number: int, suffix: str) -> str:
-    """Mapeia botão 1 para button_text/button_url/button_style e demais para buttonN_*.
-    Ex.: (1, 'text') -> button_text | (3, 'url') -> button3_url.
-    """
-    if number == 1:
-        return f"button_{suffix}"
-    return f"button{number}_{suffix}"
-
-
-def button_value(row, number: int, suffix: str, default: str = "") -> str:
-    return str(row_value(row, button_field(number, suffix), default) or "")
-
-
-def is_skip_button_text(text: str, number: int = 1) -> bool:
-    text = (text or "").strip().lower()
-    skips = {"sem botão", "sem botao", "pular", "não", "nao", "remover"}
-    if number > 1:
-        skips.update({"sem segundo botão", "sem segundo botao", "sem próximo", "sem proximo", "sem mais", "finalizar"})
-    return text in skips
-
-
-def clear_button_data(data: dict, number: int):
-    data[button_field(number, "text")] = ""
-    data[button_field(number, "url")] = ""
-    data[button_field(number, "style")] = ""
-
-
-def clear_buttons_from(data: dict, start_number: int):
-    for n in range(start_number, MAX_URL_BUTTONS + 1):
-        clear_button_data(data, n)
-
-
-def safe_int(value, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def interval_minutes_from_row(row) -> int:
-    minutes = safe_int(row_value(row, "interval_minutes", 0), 0)
-    if minutes > 0:
-        return minutes
-    return max(1, safe_int(row["interval_hours"], 1)) * 60
-
-
-def interval_label(minutes: int) -> str:
-    minutes = int(minutes)
-    if minutes < 60:
-        return f"a cada {minutes} min"
-    if minutes % 60 == 0:
-        hours = minutes // 60
-        return f"a cada {hours}h"
-    hours = minutes // 60
-    rest = minutes % 60
-    return f"a cada {hours}h{rest:02d}min"
-
-
-# Notificações privadas para o dono.
-# Por padrão, a postagem automática por intervalo NÃO avisa no PV a cada execução,
-# para não ficar enchendo o chat do dono.
-NOTIFY_INTERVAL_POSTS = env_bool("NOTIFY_INTERVAL_POSTS", False)
-NOTIFY_SCHEDULED_POSTS = env_bool("NOTIFY_SCHEDULED_POSTS", True)
-
-# Render/Webhook
-# RUN_MODE=polling para rodar localmente. RUN_MODE=webhook para Render.
+AGENCY_NAME = os.getenv("AGENCY_NAME", "Sexy Prime").strip() or "Sexy Prime"
+SITE_API_URL = os.getenv("SITE_API_URL", "https://sxyprime.com/api/bot_ads_gateway.php").strip()
+SITE_API_SECRET = os.getenv("SITE_API_SECRET", "").strip()
+SITE_PANEL_URL = os.getenv("SITE_PANEL_URL", "https://sxyprime.com/editar_perfil_modelo.php#telegram-bot-ads").strip()
+SITE_ADMIN_URL = os.getenv("SITE_ADMIN_URL", "https://sxyprime.com/admin/bot_ads.php").strip()
 RUN_MODE = os.getenv("RUN_MODE", "polling").strip().lower()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip().strip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()
 PORT = int(os.getenv("PORT", "10000") or 10000)
-
-if not WEBHOOK_SECRET and BOT_TOKEN:
-    WEBHOOK_SECRET = secrets.token_urlsafe(24)
+DB_PATH = os.getenv("DB_PATH", "data/sexy_prime_ads_runtime.db").strip()
+JOB_INTERVAL_SECONDS = max(15, int(os.getenv("JOB_INTERVAL_SECONDS", "30") or 30))
+MAX_BUTTONS = 5
 
 if not WEBHOOK_PATH:
-    WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-elif not WEBHOOK_PATH.startswith("/"):
-    WEBHOOK_PATH = "/" + WEBHOOK_PATH
+    WEBHOOK_PATH = "telegram/" + secrets.token_urlsafe(18)
+if not WEBHOOK_SECRET:
+    WEBHOOK_SECRET = secrets.token_urlsafe(24)
 
-TZ = ZoneInfo(TIMEZONE_NAME)
-
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path("logs").mkdir(exist_ok=True)
-Path("data").mkdir(exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler("logs/bot.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    handlers=[logging.StreamHandler(), logging.FileHandler("logs/bot.log", encoding="utf-8")],
 )
-logger = logging.getLogger("sexy-prime-ads")
-
-
-def now_iso() -> str:
-    return datetime.now(TZ).isoformat(timespec="seconds")
-
-
-def today_prefix() -> str:
-    return datetime.now(TZ).strftime("%Y-%m-%d")
-
-
-def normalize_url(url: str) -> str:
-    url = (url or "").strip()
-    if url.startswith("t.me/"):
-        return "https://" + url
-    if url.startswith("@"):
-        return "https://t.me/" + url[1:]
-    return url
-
-
-def is_valid_url(url: str) -> bool:
-    url = normalize_url(url)
-    return bool(re.match(r"^https?://[^\s]+\.[^\s]+", url) or url.startswith("https://t.me/"))
-
-
-def short(text: str, limit: int = 45) -> str:
-    text = str(text or "")
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
-def caption_limit(text: str) -> str:
-    # Telegram limita legenda de foto/vídeo em 1024 caracteres.
-    # Como agora salvamos HTML do próprio Telegram para preservar negrito, links
-    # e citações, não cortamos automaticamente para não quebrar tags HTML.
-    return str(text or "").strip()
-
-
-def raw_text(msg) -> str:
-    """Texto bruto recebido do Telegram, sem alterar espaços.
-
-    Isso é importante para preservar entities do Telegram, inclusive custom emojis
-    premium, porque os offsets das entities dependem exatamente do texto original.
-    """
-    return getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
-
-
-def visible_text(msg) -> str:
-    """Texto visível enviado pelo usuário, sem tags HTML."""
-    return raw_text(msg).strip()
-
-
-def rich_text_html(msg) -> str:
-    """
-    Texto em HTML gerado pelo próprio Telegram/PTB.
-    Preserva links embutidos, negrito, itálico, spoiler, código e texto citado/blockquote.
-    Se o usuário enviar texto comum, o PTB escapa caracteres perigosos automaticamente.
-    """
-    html = getattr(msg, "text_html", None) or getattr(msg, "caption_html", None)
-    if html:
-        return str(html).strip()
-    return visible_text(msg)
-
-
-def message_entities(msg) -> list:
-    """Entities de texto ou legenda enviadas/encaminhadas para o bot."""
-    return list(getattr(msg, "entities", None) or getattr(msg, "caption_entities", None) or [])
-
-
-def entities_to_json(entities: list) -> str:
-    if not entities:
-        return ""
-    try:
-        return json.dumps([entity.to_dict() for entity in entities], ensure_ascii=False)
-    except Exception as exc:
-        logger.warning("Não consegui serializar entities do anúncio: %s", exc)
-        return ""
-
-
-def entities_from_json(value: str | None, bot=None) -> list | None:
-    value = (value or "").strip()
-    if not value:
-        return None
-    try:
-        raw_entities = json.loads(value)
-        return [MessageEntity.de_json(entity, bot) for entity in raw_entities]
-    except Exception as exc:
-        logger.warning("Não consegui restaurar entities do anúncio: %s", exc)
-        return None
-
-
-def rich_text_payload(msg) -> tuple[str, str]:
-    """
-    Retorna (texto, entities_json) para salvar no banco.
-
-    Quando a mensagem tem entities, salvamos o texto bruto + entities para preservar
-    emojis premium/custom emoji, links embutidos, negrito, spoiler e blockquote.
-    Quando não tem entities, mantemos o HTML antigo para compatibilidade.
-    """
-    entities = message_entities(msg)
-    if entities:
-        return raw_text(msg), entities_to_json(entities)
-    return rich_text_html(msg), ""
-
-
-def custom_emoji_entities(msg) -> list:
-    """Retorna entities de emoji premium/custom emoji recebidas na mensagem."""
-    found = []
-    for entity in message_entities(msg):
-        entity_type = str(getattr(entity, "type", "")).lower()
-        if entity_type.endswith("custom_emoji") or entity_type == "custom_emoji":
-            found.append(entity)
-    return found
-
-
-def entities_report(msg) -> str:
-    """Relatório simples das entities recebidas pelo bot."""
-    entities = message_entities(msg)
-    if not entities:
-        return "Nenhuma entity recebida nessa mensagem."
-
-    lines = []
-    for i, entity in enumerate(entities, 1):
-        entity_type = str(getattr(entity, "type", ""))
-        custom_id = getattr(entity, "custom_emoji_id", None)
-        offset = getattr(entity, "offset", "")
-        length = getattr(entity, "length", "")
-        extra = f" | custom_emoji_id={custom_id}" if custom_id else ""
-        lines.append(f"{i}. {entity_type} | offset={offset} | length={length}{extra}")
-    return "\n".join(lines)
-
-
-async def run_emoji_diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Diagnostica se o Telegram entregou custom emojis para o bot e testa reenvio."""
-    msg = update.effective_message
-    if not msg:
-        return
-
-    entities = message_entities(msg)
-    premium_entities = custom_emoji_entities(msg)
-    text = raw_text(msg)
-    forwarded = bool(
-        getattr(msg, "forward_origin", None)
-        or getattr(msg, "forward_from", None)
-        or getattr(msg, "forward_sender_name", None)
-        or getattr(msg, "forward_from_chat", None)
-    )
-
-    if premium_entities:
-        ids = []
-        for entity in premium_entities:
-            custom_id = getattr(entity, "custom_emoji_id", None)
-            if custom_id:
-                ids.append(str(custom_id))
-        unique_ids = list(dict.fromkeys(ids))
-        ids_text = "\n".join(f"• {item}" for item in unique_ids) or "• sem ID visível"
-        await msg.reply_text(
-            "✅ Emoji premium/custom emoji detectado pelo bot.\n\n"
-            f"Quantidade detectada: {len(premium_entities)}\n"
-            f"Mensagem encaminhada: {'sim' if forwarded else 'não'}\n\n"
-            "IDs detectados:\n"
-            f"{ids_text}\n\n"
-            "Agora vou reenviar abaixo o mesmo texto usando as entities recebidas. "
-            "Se no teste abaixo o emoji não aparecer premium, então o Telegram está bloqueando/convertendo na saída pelo bot."
-        )
-    else:
-        await msg.reply_text(
-            "❌ Nenhum emoji premium/custom emoji foi entregue ao bot nessa mensagem.\n\n"
-            f"Mensagem encaminhada: {'sim' if forwarded else 'não'}\n"
-            f"Entities totais recebidas: {len(entities)}\n\n"
-            "Relatório das entities:\n"
-            f"{entities_report(msg)}\n\n"
-            "Tente encaminhar a mensagem original direto para o bot, sem copiar e colar."
-        )
-        return
-
-    if text and entities:
-        try:
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=text,
-                entities=entities,
-                disable_web_page_preview=True,
-            )
-            await msg.reply_text(
-                "Teste enviado.\n\n"
-                "Se a mensagem acima apareceu sem emoji premium, o bot recebeu o ID, mas o Telegram não permitiu o reenvio premium."
-            )
-        except TelegramError as exc:
-            await msg.reply_text(
-                "⚠️ O bot detectou emoji premium, mas o Telegram recusou o reenvio com entities.\n\n"
-                f"Erro: {type(exc).__name__}: {exc}"
-            )
-    else:
-        await msg.reply_text(
-            "Detectei emoji premium, mas não encontrei texto/legenda bruto para reenviar no teste. "
-            "Tente encaminhar uma mensagem de texto com o emoji premium."
-        )
-
-
-def row_value(row, key: str, default=""):
-    try:
-        if row is not None and key in row.keys():
-            value = row[key]
-            return default if value is None else value
-    except Exception:
-        pass
-    return default
-
-
-class Database:
-    def __init__(self, path: str):
-        self.path = path
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.init_db()
-
-    def conn(self):
-        con = sqlite3.connect(self.path)
-        con.row_factory = sqlite3.Row
-        return con
-
-    def init_db(self):
-        with self.conn() as con:
-            cur = con.cursor()
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS admins (
-                    user_id INTEGER PRIMARY KEY,
-                    name TEXT,
-                    role TEXT DEFAULT 'admin',
-                    active INTEGER DEFAULT 1,
-                    created_at TEXT
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ads (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    media_type TEXT NOT NULL,
-                    media_file_id TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    description_entities TEXT DEFAULT '',
-                    button_text TEXT,
-                    button_url TEXT,
-                    button_style TEXT DEFAULT '',
-                    button2_text TEXT DEFAULT '',
-                    button2_url TEXT DEFAULT '',
-                    button2_style TEXT DEFAULT '',
-                    button3_text TEXT DEFAULT '',
-                    button3_url TEXT DEFAULT '',
-                    button3_style TEXT DEFAULT '',
-                    button4_text TEXT DEFAULT '',
-                    button4_url TEXT DEFAULT '',
-                    button4_style TEXT DEFAULT '',
-                    button5_text TEXT DEFAULT '',
-                    button5_url TEXT DEFAULT '',
-                    button5_style TEXT DEFAULT '',
-                    pin_message INTEGER DEFAULT 1,
-                    delete_previous INTEGER DEFAULT 1,
-                    active INTEGER DEFAULT 1,
-                    created_at TEXT,
-                    updated_at TEXT
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS targets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER UNIQUE NOT NULL,
-                    chat_title TEXT,
-                    chat_type TEXT,
-                    approved INTEGER DEFAULT 0,
-                    active INTEGER DEFAULT 1,
-                    can_pin INTEGER DEFAULT 0,
-                    added_at TEXT,
-                    updated_at TEXT
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schedules (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ad_id INTEGER NOT NULL,
-                    hour INTEGER NOT NULL,
-                    minute INTEGER NOT NULL,
-                    days TEXT DEFAULT '0,1,2,3,4,5,6',
-                    active INTEGER DEFAULT 1,
-                    created_at TEXT,
-                    FOREIGN KEY(ad_id) REFERENCES ads(id)
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS interval_schedules (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ad_id INTEGER NOT NULL,
-                    interval_hours INTEGER NOT NULL,
-                    interval_minutes INTEGER DEFAULT 0,
-                    active INTEGER DEFAULT 1,
-                    created_at TEXT,
-                    updated_at TEXT,
-                    last_run_at TEXT,
-                    FOREIGN KEY(ad_id) REFERENCES ads(id)
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS post_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ad_id INTEGER,
-                    chat_id INTEGER,
-                    message_id INTEGER,
-                    status TEXT,
-                    error_message TEXT,
-                    created_at TEXT
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS last_posts (
-                    chat_id INTEGER PRIMARY KEY,
-                    message_id INTEGER,
-                    ad_id INTEGER,
-                    posted_at TEXT
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-                """
-            )
-
-            # Migração segura para versões antigas do banco: adiciona suporte a entities,
-            # até 5 botões URL coloridos e intervalos em minutos.
-            for column_sql in (
-                "ALTER TABLE ads ADD COLUMN description_entities TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button_style TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button2_text TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button2_url TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button2_style TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button3_text TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button3_url TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button3_style TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button4_text TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button4_url TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button4_style TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button5_text TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button5_url TEXT DEFAULT ''",
-                "ALTER TABLE ads ADD COLUMN button5_style TEXT DEFAULT ''",
-                "ALTER TABLE interval_schedules ADD COLUMN interval_minutes INTEGER DEFAULT 0",
-            ):
-                try:
-                    cur.execute(column_sql)
-                except sqlite3.OperationalError:
-                    pass
-
-            if OWNER_ID:
-                cur.execute(
-                    """
-                    INSERT OR IGNORE INTO admins (user_id, name, role, active, created_at)
-                    VALUES (?, ?, 'owner', 1, ?)
-                    """,
-                    (OWNER_ID, "Dono", now_iso()),
-                )
-
-            con.commit()
-
-    # ---------- Admins ----------
-    def is_admin(self, user_id: int) -> bool:
-        if user_id == OWNER_ID:
-            return True
-        with self.conn() as con:
-            row = con.execute(
-                "SELECT active FROM admins WHERE user_id=? AND active=1",
-                (user_id,),
-            ).fetchone()
-            return bool(row)
-
-    def add_admin(self, user_id: int, name: str = ""):
-        with self.conn() as con:
-            con.execute(
-                """
-                INSERT INTO admins (user_id, name, role, active, created_at)
-                VALUES (?, ?, 'admin', 1, ?)
-                ON CONFLICT(user_id) DO UPDATE SET active=1, name=excluded.name
-                """,
-                (user_id, name, now_iso()),
-            )
-            con.commit()
-
-    def remove_admin(self, user_id: int):
-        with self.conn() as con:
-            con.execute("UPDATE admins SET active=0 WHERE user_id=?", (user_id,))
-            con.commit()
-
-    def list_admins(self):
-        with self.conn() as con:
-            return con.execute(
-                "SELECT * FROM admins WHERE active=1 ORDER BY role DESC, user_id ASC"
-            ).fetchall()
-
-    # ---------- Ads ----------
-    def create_ad(self, data: dict) -> int:
-        with self.conn() as con:
-            cur = con.execute(
-                """
-                INSERT INTO ads (
-                    title, media_type, media_file_id, description, description_entities,
-                    button_text, button_url, button_style,
-                    button2_text, button2_url, button2_style,
-                    button3_text, button3_url, button3_style,
-                    button4_text, button4_url, button4_style,
-                    button5_text, button5_url, button5_style,
-                    pin_message, delete_previous, active, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-                """,
-                (
-                    data["title"],
-                    data["media_type"],
-                    data["media_file_id"],
-                    data["description"],
-                    data.get("description_entities") or "",
-                    data.get("button_text") or "",
-                    data.get("button_url") or "",
-                    normalize_button_style(data.get("button_style") or ""),
-                    data.get("button2_text") or "",
-                    data.get("button2_url") or "",
-                    normalize_button_style(data.get("button2_style") or ""),
-                    data.get("button3_text") or "",
-                    data.get("button3_url") or "",
-                    normalize_button_style(data.get("button3_style") or ""),
-                    data.get("button4_text") or "",
-                    data.get("button4_url") or "",
-                    normalize_button_style(data.get("button4_style") or ""),
-                    data.get("button5_text") or "",
-                    data.get("button5_url") or "",
-                    normalize_button_style(data.get("button5_style") or ""),
-                    int(data.get("pin_message", 1)),
-                    int(data.get("delete_previous", 1)),
-                    now_iso(),
-                    now_iso(),
-                ),
-            )
-            con.commit()
-            return int(cur.lastrowid)
-
-    def update_ad_field(self, ad_id: int, field: str, value):
-        allowed = {
-            "title",
-            "media_type",
-            "media_file_id",
-            "description",
-            "description_entities",
-            "button_text",
-            "button_url",
-            "button_style",
-            "button2_text",
-            "button2_url",
-            "button2_style",
-            "button3_text",
-            "button3_url",
-            "button3_style",
-            "button4_text",
-            "button4_url",
-            "button4_style",
-            "button5_text",
-            "button5_url",
-            "button5_style",
-            "pin_message",
-            "delete_previous",
-            "active",
-        }
-        if field not in allowed:
-            raise ValueError("Campo inválido.")
-        with self.conn() as con:
-            con.execute(
-                f"UPDATE ads SET {field}=?, updated_at=? WHERE id=?",
-                (value, now_iso(), ad_id),
-            )
-            con.commit()
-
-    def get_ad(self, ad_id: int):
-        with self.conn() as con:
-            return con.execute("SELECT * FROM ads WHERE id=?", (ad_id,)).fetchone()
-
-    def list_ads(self, active_only: bool = False, limit: int = 100, offset: int = 0):
-        with self.conn() as con:
-            where = "WHERE active=1" if active_only else ""
-            return con.execute(
-                f"SELECT * FROM ads {where} ORDER BY id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-
-    def count_ads(self):
-        with self.conn() as con:
-            return con.execute("SELECT COUNT(*) AS c FROM ads").fetchone()["c"]
-
-    def delete_ad_hard(self, ad_id: int) -> dict:
-        """Exclui o anúncio do banco e remove agendamentos ligados a ele.
-
-        Mantém post_logs/last_posts para histórico e para o recurso de apagar
-        a postagem anterior continuar funcionando no próximo anúncio.
+logger = logging.getLogger("sexy-prime-bot-ads")
+
+UNLINKED_MESSAGE = "Vincule seu perfil ao seu painel para liberar o bot."
+STATUS_LABELS = {
+    "pending": "Aguardando aprovação",
+    "approved": "Aprovado",
+    "rejected": "Recusado",
+    "scheduled": "Agendado",
+    "completed": "Concluído",
+    "draft": "Rascunho",
+}
+
+
+def validate_environment() -> None:
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not SITE_API_URL:
+        missing.append("SITE_API_URL")
+    if not SITE_API_SECRET:
+        missing.append("SITE_API_SECRET")
+    if missing:
+        raise RuntimeError("Variáveis obrigatórias ausentes: " + ", ".join(missing))
+
+
+def runtime_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
         """
-        with self.conn() as con:
-            ad = con.execute("SELECT id, title FROM ads WHERE id=?", (ad_id,)).fetchone()
-            if not ad:
-                return {"deleted": False, "schedule_ids": [], "interval_ids": []}
-
-            schedule_rows = con.execute(
-                "SELECT id FROM schedules WHERE ad_id=?",
-                (ad_id,),
-            ).fetchall()
-            interval_rows = con.execute(
-                "SELECT id FROM interval_schedules WHERE ad_id=?",
-                (ad_id,),
-            ).fetchall()
-            schedule_ids = [int(r["id"]) for r in schedule_rows]
-            interval_ids = [int(r["id"]) for r in interval_rows]
-
-            con.execute("DELETE FROM schedules WHERE ad_id=?", (ad_id,))
-            con.execute("DELETE FROM interval_schedules WHERE ad_id=?", (ad_id,))
-            con.execute("DELETE FROM ads WHERE id=?", (ad_id,))
-            con.commit()
-
-            return {
-                "deleted": True,
-                "title": ad["title"],
-                "schedule_ids": schedule_ids,
-                "interval_ids": interval_ids,
-            }
-
-    # ---------- Targets ----------
-    def upsert_target(self, chat_id: int, title: str, chat_type: str, can_pin: bool):
-        with self.conn() as con:
-            con.execute(
-                """
-                INSERT INTO targets (
-                    chat_id, chat_title, chat_type, approved, active, can_pin,
-                    added_at, updated_at
-                )
-                VALUES (?, ?, ?, 0, 1, ?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    chat_title=excluded.chat_title,
-                    chat_type=excluded.chat_type,
-                    active=1,
-                    can_pin=excluded.can_pin,
-                    updated_at=excluded.updated_at
-                """,
-                (chat_id, title, chat_type, int(can_pin), now_iso(), now_iso()),
-            )
-            con.commit()
-
-    def set_target_approved(self, chat_id: int, approved: bool):
-        with self.conn() as con:
-            con.execute(
-                "UPDATE targets SET approved=?, active=1, updated_at=? WHERE chat_id=?",
-                (int(approved), now_iso(), chat_id),
-            )
-            con.commit()
-
-    def set_target_active(self, chat_id: int, active: bool):
-        with self.conn() as con:
-            con.execute(
-                "UPDATE targets SET active=?, updated_at=? WHERE chat_id=?",
-                (int(active), now_iso(), chat_id),
-            )
-            con.commit()
-
-    def mark_target_inactive(self, chat_id: int):
-        self.set_target_active(chat_id, False)
-
-    def get_target(self, chat_id: int):
-        with self.conn() as con:
-            return con.execute("SELECT * FROM targets WHERE chat_id=?", (chat_id,)).fetchone()
-
-    def list_targets(self, approved=None, active=None, limit: int = 30):
-        clauses = []
-        params = []
-        if approved is not None:
-            clauses.append("approved=?")
-            params.append(int(approved))
-        if active is not None:
-            clauses.append("active=?")
-            params.append(int(active))
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.conn() as con:
-            return con.execute(
-                f"SELECT * FROM targets {where} ORDER BY updated_at DESC LIMIT ?",
-                (*params, limit),
-            ).fetchall()
-
-    def count_targets(self, approved=None, active=None):
-        clauses = []
-        params = []
-        if approved is not None:
-            clauses.append("approved=?")
-            params.append(int(approved))
-        if active is not None:
-            clauses.append("active=?")
-            params.append(int(active))
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.conn() as con:
-            return con.execute(f"SELECT COUNT(*) AS c FROM targets {where}", params).fetchone()["c"]
-
-    # ---------- Schedules ----------
-    def create_schedule(self, ad_id: int, hour: int, minute: int, days: str = "0,1,2,3,4,5,6") -> int:
-        with self.conn() as con:
-            cur = con.execute(
-                """
-                INSERT INTO schedules (ad_id, hour, minute, days, active, created_at)
-                VALUES (?, ?, ?, ?, 1, ?)
-                """,
-                (ad_id, hour, minute, days, now_iso()),
-            )
-            con.commit()
-            return int(cur.lastrowid)
-
-    def get_schedule(self, schedule_id: int):
-        with self.conn() as con:
-            return con.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
-
-    def list_schedules(self, active_only: bool = False):
-        where = "WHERE s.active=1" if active_only else ""
-        with self.conn() as con:
-            return con.execute(
-                f"""
-                SELECT s.*, a.title AS ad_title
-                FROM schedules s
-                LEFT JOIN ads a ON a.id=s.ad_id
-                {where}
-                ORDER BY s.hour ASC, s.minute ASC
-                """
-            ).fetchall()
-
-    def set_schedule_active(self, schedule_id: int, active: bool):
-        with self.conn() as con:
-            con.execute(
-                "UPDATE schedules SET active=? WHERE id=?",
-                (int(active), schedule_id),
-            )
-            con.commit()
-
-    def count_schedules(self, active=True):
-        with self.conn() as con:
-            return con.execute(
-                "SELECT COUNT(*) AS c FROM schedules WHERE active=?",
-                (int(active),),
-            ).fetchone()["c"]
-
-    # ---------- Interval schedules ----------
-    def create_interval_schedule(self, ad_id: int, interval_minutes: int) -> int:
-        interval_minutes = int(interval_minutes)
-        if interval_minutes < 5 or interval_minutes > 24 * 60:
-            raise ValueError("Intervalo inválido. Use de 5 minutos até 24 horas.")
-        interval_hours_compat = max(1, round(interval_minutes / 60))
-        with self.conn() as con:
-            cur = con.execute(
-                """
-                INSERT INTO interval_schedules (
-                    ad_id, interval_hours, interval_minutes, active, created_at, updated_at, last_run_at
-                )
-                VALUES (?, ?, ?, 1, ?, ?, NULL)
-                """,
-                (ad_id, interval_hours_compat, interval_minutes, now_iso(), now_iso()),
-            )
-            con.commit()
-            return int(cur.lastrowid)
-
-    def get_interval_schedule(self, interval_id: int):
-        with self.conn() as con:
-            return con.execute("SELECT * FROM interval_schedules WHERE id=?", (interval_id,)).fetchone()
-
-    def list_interval_schedules(self, active_only: bool = False):
-        where = "WHERE i.active=1" if active_only else ""
-        with self.conn() as con:
-            return con.execute(
-                f"""
-                SELECT i.*, a.title AS ad_title
-                FROM interval_schedules i
-                LEFT JOIN ads a ON a.id=i.ad_id
-                {where}
-                ORDER BY i.id DESC
-                """
-            ).fetchall()
-
-    def set_interval_schedule_active(self, interval_id: int, active: bool):
-        with self.conn() as con:
-            con.execute(
-                "UPDATE interval_schedules SET active=?, updated_at=? WHERE id=?",
-                (int(active), now_iso(), interval_id),
-            )
-            con.commit()
-
-    def disable_active_intervals_for_ad(self, ad_id: int) -> list[int]:
-        with self.conn() as con:
-            rows = con.execute(
-                "SELECT id FROM interval_schedules WHERE ad_id=? AND active=1",
-                (ad_id,),
-            ).fetchall()
-            ids = [int(r["id"]) for r in rows]
-            con.execute(
-                "UPDATE interval_schedules SET active=0, updated_at=? WHERE ad_id=? AND active=1",
-                (now_iso(), ad_id),
-            )
-            con.commit()
-            return ids
-
-    def mark_interval_ran(self, interval_id: int):
-        with self.conn() as con:
-            con.execute(
-                "UPDATE interval_schedules SET last_run_at=?, updated_at=? WHERE id=?",
-                (now_iso(), now_iso(), interval_id),
-            )
-            con.commit()
-
-    def count_interval_schedules(self, active=True):
-        with self.conn() as con:
-            return con.execute(
-                "SELECT COUNT(*) AS c FROM interval_schedules WHERE active=?",
-                (int(active),),
-            ).fetchone()["c"]
-
-    # ---------- Logs ----------
-    def add_log(self, ad_id, chat_id, message_id, status, error_message=""):
-        with self.conn() as con:
-            con.execute(
-                """
-                INSERT INTO post_logs (ad_id, chat_id, message_id, status, error_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (ad_id, chat_id, message_id, status, error_message or "", now_iso()),
-            )
-            con.commit()
-
-    def get_last_post(self, chat_id: int):
-        with self.conn() as con:
-            return con.execute(
-                "SELECT * FROM last_posts WHERE chat_id=?",
-                (chat_id,),
-            ).fetchone()
-
-    def set_last_post(self, chat_id: int, message_id: int, ad_id: int):
-        with self.conn() as con:
-            con.execute(
-                """
-                INSERT INTO last_posts (chat_id, message_id, ad_id, posted_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    message_id=excluded.message_id,
-                    ad_id=excluded.ad_id,
-                    posted_at=excluded.posted_at
-                """,
-                (chat_id, message_id, ad_id, now_iso()),
-            )
-            con.commit()
-
-    def stats_today(self):
-        with self.conn() as con:
-            total = con.execute(
-                "SELECT COUNT(*) AS c FROM post_logs WHERE created_at LIKE ?",
-                (today_prefix() + "%",),
-            ).fetchone()["c"]
-            ok = con.execute(
-                "SELECT COUNT(*) AS c FROM post_logs WHERE status='success' AND created_at LIKE ?",
-                (today_prefix() + "%",),
-            ).fetchone()["c"]
-            fail = con.execute(
-                "SELECT COUNT(*) AS c FROM post_logs WHERE status='error' AND created_at LIKE ?",
-                (today_prefix() + "%",),
-            ).fetchone()["c"]
-            return {"total": total, "success": ok, "error": fail}
-
-    def recent_errors(self, limit: int = 8):
-        with self.conn() as con:
-            return con.execute(
-                """
-                SELECT l.*, t.chat_title
-                FROM post_logs l
-                LEFT JOIN targets t ON t.chat_id=l.chat_id
-                WHERE l.status='error'
-                ORDER BY l.id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-
-db = Database(DB_PATH)
-
-
-# ============================================================
-# Menus
-# ============================================================
-
-def support_keyboard():
-    if SUPPORT_URL and is_valid_url(SUPPORT_URL):
-        return InlineKeyboardMarkup([[InlineKeyboardButton("💬 Suporte Sexy Prime", url=SUPPORT_URL)]])
-    return None
-
-
-def main_menu():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("➕ Criar anúncio", callback_data="ad:new")],
-            [
-                InlineKeyboardButton("📋 Meus anúncios", callback_data="ad:list"),
-                InlineKeyboardButton("⏰ Agendamentos", callback_data="sched:list"),
-            ],
-            [InlineKeyboardButton("🔁 Postagem automática", callback_data="interval:list")],
-            [
-                InlineKeyboardButton("📍 Destinos pendentes", callback_data="tg:pending"),
-                InlineKeyboardButton("✅ Destinos aprovados", callback_data="tg:approved"),
-            ],
-            [InlineKeyboardButton("🔄 Sincronizar destinos", callback_data="tg:sync")],
-            [
-                InlineKeyboardButton("📊 Estatísticas", callback_data="stats"),
-                InlineKeyboardButton("⚙️ Configurações", callback_data="settings"),
-            ],
-        ]
+        CREATE TABLE IF NOT EXISTS last_posts (
+            destination_id INTEGER PRIMARY KEY,
+            telegram_chat_id INTEGER NOT NULL,
+            telegram_message_id INTEGER NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
     )
+    conn.commit()
+    return conn
 
 
-def back_home():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar ao painel", callback_data="menu:home")]])
+def save_last_post(destination_id: int, chat_id: int, message_id: int) -> None:
+    with runtime_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO last_posts(destination_id, telegram_chat_id, telegram_message_id, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(destination_id) DO UPDATE SET
+                telegram_chat_id=excluded.telegram_chat_id,
+                telegram_message_id=excluded.telegram_message_id,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (destination_id, chat_id, message_id),
+        )
 
 
-def yes_no_keyboard(prefix: str):
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Sim", callback_data=f"{prefix}:1"),
-                InlineKeyboardButton("❌ Não", callback_data=f"{prefix}:0"),
-            ],
-            [InlineKeyboardButton("Cancelar", callback_data="cancel")],
-        ]
-    )
+def last_post(destination_id: int) -> tuple[int, int] | None:
+    with runtime_db() as conn:
+        row = conn.execute(
+            "SELECT telegram_chat_id, telegram_message_id FROM last_posts WHERE destination_id = ?",
+            (destination_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return int(row["telegram_chat_id"]), int(row["telegram_message_id"])
 
 
-def ad_keyboard(ad_id: int):
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("👁 Prévia", callback_data=f"ad:preview:{ad_id}"),
-                InlineKeyboardButton("🚀 Postar agora", callback_data=f"ad:post:{ad_id}"),
-            ],
-            [
-                InlineKeyboardButton("⏰ Agendar", callback_data=f"ad:schedule:{ad_id}"),
-                InlineKeyboardButton("🔁 Automático", callback_data=f"ad:interval:{ad_id}"),
-            ],
-            [
-                InlineKeyboardButton("✏️ Editar", callback_data=f"ad:edit:{ad_id}"),
-                InlineKeyboardButton("🗑 Remover", callback_data=f"ad:delete:{ad_id}"),
-            ],
-            [
-                InlineKeyboardButton("⬅️ Lista", callback_data="ad:list"),
-            ],
-        ]
-    )
+def clear_last_post(destination_id: int) -> None:
+    with runtime_db() as conn:
+        conn.execute("DELETE FROM last_posts WHERE destination_id = ?", (destination_id,))
 
 
-def ad_edit_keyboard(ad):
-    pin = "✅ Fixar" if ad["pin_message"] else "❌ Fixar"
-    delete = "✅ Apagar anterior" if ad["delete_previous"] else "❌ Apagar anterior"
-    active = "✅ Ativo" if ad["active"] else "❌ Desativado"
-    ad_id = ad["id"]
+def valid_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value.strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+async def api_request(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = dict(payload or {})
+    data["action"] = action
+    timeout = aiohttp.ClientTimeout(total=90)
+    headers = {"X-SXP-Bot-Secret": SITE_API_SECRET}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.post(SITE_API_URL, json=data) as response:
+            try:
+                result = await response.json(content_type=None)
+            except Exception:
+                text = await response.text()
+                raise RuntimeError(f"Resposta inválida do site ({response.status}): {text[:300]}")
+            if not result.get("success"):
+                raise RuntimeError(str(result.get("message") or "Falha ao comunicar com o site."))
+            return result
+
+
+async def api_submit_ad(payload: dict[str, Any], media_path: str | None, media_name: str, media_mime: str) -> dict[str, Any]:
+    form = aiohttp.FormData()
+    for key, value in payload.items():
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)
+        form.add_field(key, str(value))
+
+    file_handle = None
+    try:
+        if media_path and Path(media_path).is_file():
+            file_handle = open(media_path, "rb")
+            form.add_field(
+                "media",
+                file_handle,
+                filename=media_name or Path(media_path).name,
+                content_type=media_mime or "application/octet-stream",
+            )
+        timeout = aiohttp.ClientTimeout(total=180)
+        headers = {"X-SXP-Bot-Secret": SITE_API_SECRET}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.post(SITE_API_URL, data=form) as response:
+                result = await response.json(content_type=None)
+                if not result.get("success"):
+                    raise RuntimeError(str(result.get("message") or "Não foi possível enviar o anúncio."))
+                return result
+    finally:
+        if file_handle:
+            file_handle.close()
+
+
+def linked_keyboard(is_owner: bool = False) -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton("➕ Enviar anúncio", callback_data="ads:new")],
         [
-            InlineKeyboardButton("Título", callback_data=f"ad:editfield:{ad_id}:title"),
-            InlineKeyboardButton("Descrição", callback_data=f"ad:editfield:{ad_id}:description"),
+            InlineKeyboardButton("💳 Meu saldo", callback_data="ads:balance"),
+            InlineKeyboardButton("📋 Meus anúncios", callback_data="ads:mine"),
         ],
-        [InlineKeyboardButton("Mídia", callback_data=f"ad:editmedia:{ad_id}")],
     ]
-    for n in range(1, MAX_URL_BUTTONS + 1):
-        rows.append([
-            InlineKeyboardButton(f"Botão {n}", callback_data=f"ad:editfield:{ad_id}:{button_field(n, 'text')}"),
-            InlineKeyboardButton(f"URL {n}", callback_data=f"ad:editfield:{ad_id}:{button_field(n, 'url')}"),
-            InlineKeyboardButton(f"Cor {n}", callback_data=f"ad:editfield:{ad_id}:{button_field(n, 'style')}"),
-        ])
-    rows.extend([
-        [
-            InlineKeyboardButton(pin, callback_data=f"ad:togglepin:{ad_id}"),
-            InlineKeyboardButton(delete, callback_data=f"ad:toggledel:{ad_id}"),
-        ],
-        [InlineKeyboardButton(active, callback_data=f"ad:toggleactive:{ad_id}")],
-        [InlineKeyboardButton("⬅️ Voltar", callback_data=f"ad:view:{ad_id}")],
-    ])
+    if is_owner and SITE_ADMIN_URL:
+        rows.append([InlineKeyboardButton("⚙️ Painel administrativo", url=SITE_ADMIN_URL)])
     return InlineKeyboardMarkup(rows)
 
 
-# ============================================================
-# Helpers
-# ============================================================
-
-def user_id_from_update(update: Update) -> int:
-    if update.effective_user:
-        return int(update.effective_user.id)
-    return 0
+def unlinked_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Vincular no painel", url=SITE_PANEL_URL)]])
 
 
-def is_admin(user_id: int) -> bool:
-    return db.is_admin(user_id)
-
-
-async def safe_edit(query, text: str, reply_markup=None):
+async def profile_for(user_id: int) -> dict[str, Any] | None:
     try:
-        await query.edit_message_text(text=text, reply_markup=reply_markup)
-    except BadRequest:
-        await query.message.reply_text(text=text, reply_markup=reply_markup)
+        result = await api_request("profile", {"telegram_user_id": user_id})
+        return result
+    except RuntimeError as exc:
+        logger.warning("Falha ao consultar perfil %s: %s", user_id, exc)
+        return None
 
 
-async def require_admin_update(update: Update) -> bool:
-    uid = user_id_from_update(update)
-    if is_admin(uid):
-        return True
-
-    if update.message and update.effective_chat and update.effective_chat.type == "private":
-        await update.message.reply_text(
-            f"🔒 Este bot é de uso exclusivo da Agência {AGENCY_NAME}.\n\n"
-            "Se você precisa de atendimento, fale com o suporte oficial.",
-            reply_markup=support_keyboard(),
-        )
-    return False
-
-
-async def require_admin_query(query) -> bool:
-    uid = query.from_user.id if query and query.from_user else 0
-    if is_admin(uid):
-        return True
-    await query.answer("Acesso negado. Bot exclusivo da agência.", show_alert=True)
-    return False
-
-
-def ad_text(ad) -> str:
-    lines = [
-        f"📌 Anúncio #{ad['id']}",
-        "",
-        f"Nome: {ad['title']}",
-        f"Mídia: {ad['media_type']}",
-    ]
-    for n in range(1, MAX_URL_BUTTONS + 1):
-        text = button_value(ad, n, "text")
-        style = button_style_name(button_value(ad, n, "style"))
-        if text:
-            lines.append(f"Botão {n}: {text} | Cor: {style}")
-    if not any(button_value(ad, n, "text") for n in range(1, MAX_URL_BUTTONS + 1)):
-        lines.append("Botões: sem botão")
-    lines.extend([
-        f"Fixar: {'sim' if ad['pin_message'] else 'não'}",
-        f"Apagar anterior: {'sim' if ad['delete_previous'] else 'não'}",
-        f"Status: {'ativo' if ad['active'] else 'desativado'}",
-        "",
-        f"Descrição:\n{ad['description']}",
-    ])
-    return "\n".join(lines)
-
-
-async def send_ad_to_chat(bot, chat_id: int, ad, *, preview=False) -> tuple[bool, str, int | None]:
-    """
-    Envia anúncio para um chat.
-    preview=True não apaga/fixa/loga e é usado só para o dono ver a prévia.
-    """
-    reply_markup = None
-    buttons = []
-
-    for n in range(1, MAX_URL_BUTTONS + 1):
-        button_text = button_value(ad, n, "text").strip()
-        button_url = normalize_url(button_value(ad, n, "url"))
-        if button_text and button_url and is_valid_url(button_url):
-            button_style = button_value(ad, n, "style")
-            buttons.append([url_button(button_text, button_url, button_style)])
-
-    if buttons:
-        reply_markup = InlineKeyboardMarkup(buttons)
-
-    try:
-        if not preview and int(ad["delete_previous"]):
-            last = db.get_last_post(chat_id)
-            if last and last["message_id"]:
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=int(last["message_id"]))
-                except TelegramError as e:
-                    logger.warning("Não consegui apagar postagem anterior em %s: %s", chat_id, e)
-
-        entities_json = row_value(ad, "description_entities", "")
-        saved_entities = entities_from_json(entities_json, bot)
-        # Quando há entities salvas, não aplicamos strip/corte no texto, porque
-        # os offsets das entities precisam bater exatamente com o texto original.
-        caption = str(ad["description"] or "") if saved_entities else caption_limit(ad["description"])
-
-        if ad["media_type"] == "photo":
-            kwargs = {
-                "chat_id": chat_id,
-                "photo": ad["media_file_id"],
-                "caption": caption,
-                "reply_markup": reply_markup,
-            }
-            if saved_entities:
-                kwargs["caption_entities"] = saved_entities
-            else:
-                kwargs["parse_mode"] = ParseMode.HTML
-            msg = await bot.send_photo(**kwargs)
-        elif ad["media_type"] == "video":
-            kwargs = {
-                "chat_id": chat_id,
-                "video": ad["media_file_id"],
-                "caption": caption,
-                "supports_streaming": True,
-                "reply_markup": reply_markup,
-            }
-            if saved_entities:
-                kwargs["caption_entities"] = saved_entities
-            else:
-                kwargs["parse_mode"] = ParseMode.HTML
-            msg = await bot.send_video(**kwargs)
-        else:
-            kwargs = {
-                "chat_id": chat_id,
-                "text": caption,
-                "disable_web_page_preview": False,
-                "reply_markup": reply_markup,
-            }
-            if saved_entities:
-                kwargs["entities"] = saved_entities
-            else:
-                kwargs["parse_mode"] = ParseMode.HTML
-            msg = await bot.send_message(**kwargs)
-
-        if not preview and int(ad["pin_message"]):
-            try:
-                await bot.pin_chat_message(
-                    chat_id=chat_id,
-                    message_id=msg.message_id,
-                    disable_notification=True,
-                )
-            except TelegramError as e:
-                logger.warning("Não consegui fixar em %s: %s", chat_id, e)
-
-        if not preview:
-            db.set_last_post(chat_id, msg.message_id, int(ad["id"]))
-            db.add_log(int(ad["id"]), chat_id, msg.message_id, "success")
-
-        return True, "success", msg.message_id
-
-    except Forbidden as e:
-        if not preview:
-            db.mark_target_inactive(chat_id)
-            db.add_log(int(ad["id"]), chat_id, None, "error", f"Forbidden: {e}")
-        return False, f"Sem permissão ou bot removido: {e}", None
-
-    except TelegramError as e:
-        if not preview:
-            db.add_log(int(ad["id"]), chat_id, None, "error", str(e))
-        return False, str(e), None
-
-
-async def post_ad_to_all(bot, ad) -> dict:
-    targets = db.list_targets(approved=True, active=True, limit=500)
-    result = {"success": 0, "error": 0, "total": len(targets)}
-
-    for target in targets:
-        ok, err, _message_id = await send_ad_to_chat(bot, int(target["chat_id"]), ad, preview=False)
-        if ok:
-            result["success"] += 1
-        else:
-            result["error"] += 1
-            logger.warning("Falha ao postar em %s: %s", target["chat_id"], err)
-
-    return result
-
-
-# ============================================================
-# Agendamentos
-# ============================================================
-
-def schedule_job(application: Application, schedule_row):
-    if not application.job_queue:
-        logger.error("JobQueue indisponível. Instale: pip install \"python-telegram-bot[job-queue]\"")
+async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE, notice: str = "") -> None:
+    user = update.effective_user
+    if not user:
+        return
+    result = await profile_for(user.id)
+    target = update.callback_query.message if update.callback_query else update.effective_message
+    if not target:
         return
 
-    name = f"schedule_{schedule_row['id']}"
+    if not result:
+        await target.reply_text("Não foi possível consultar seu perfil agora. Tente novamente.")
+        return
 
-    for job in application.job_queue.get_jobs_by_name(name):
-        job.schedule_removal()
+    if not result.get("linked"):
+        await target.reply_text(UNLINKED_MESSAGE, reply_markup=unlinked_keyboard())
+        return
 
-    days = tuple(int(d) for d in str(schedule_row["days"]).split(",") if d.strip().isdigit())
-    run_time = time(
-        hour=int(schedule_row["hour"]),
-        minute=int(schedule_row["minute"]),
-        second=0,
-        tzinfo=TZ,
+    model = result.get("model") or {}
+    wallet = result.get("wallet") or {}
+    text = (
+        f"🔥 <b>{AGENCY_NAME} — Bot ADS</b>\n\n"
+        f"Perfil: <b>{model.get('name', 'Modelo')}</b>\n"
+        f"Créditos disponíveis: <b>{int(wallet.get('credits', 0))}</b>\n"
+        f"Pontos no site: <b>{int(wallet.get('points', 0))}</b>"
     )
-
-    application.job_queue.run_daily(
-        scheduled_post_job,
-        time=run_time,
-        days=days,
-        data={"schedule_id": int(schedule_row["id"])},
-        name=name,
-    )
-
-    logger.info("Agendamento carregado: %s às %02d:%02d", name, schedule_row["hour"], schedule_row["minute"])
+    if notice:
+        text = notice + "\n\n" + text
+    await target.reply_text(text, parse_mode="HTML", reply_markup=linked_keyboard(user.id == OWNER_ID))
 
 
-def remove_schedule_job(application: Application, schedule_id: int):
-    if not application.job_queue:
-        return
-    name = f"schedule_{schedule_id}"
-    for job in application.job_queue.get_jobs_by_name(name):
-        job.schedule_removal()
-
-
-def schedule_interval_job(application: Application, interval_row):
-    if not application.job_queue:
-        logger.error('JobQueue indisponível. Instale: pip install "python-telegram-bot[job-queue]"')
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or update.effective_chat.type != ChatType.PRIVATE:
         return
 
-    name = f"interval_{interval_row['id']}"
-
-    for job in application.job_queue.get_jobs_by_name(name):
-        job.schedule_removal()
-
-    interval_minutes = interval_minutes_from_row(interval_row)
-    interval_seconds = interval_minutes * 60
-
-    application.job_queue.run_repeating(
-        interval_post_job,
-        interval=interval_seconds,
-        first=interval_seconds,
-        data={"interval_id": int(interval_row["id"])},
-        name=name,
-    )
-
-    logger.info(
-        "Postagem automática carregada: %s %s",
-        name,
-        interval_label(interval_minutes),
-    )
-
-
-def remove_interval_job(application: Application, interval_id: int):
-    if not application.job_queue:
-        return
-    name = f"interval_{interval_id}"
-    for job in application.job_queue.get_jobs_by_name(name):
-        job.schedule_removal()
-
-
-def load_schedules(application: Application):
-    for sched in db.list_schedules(active_only=True):
-        schedule_job(application, sched)
-    for interval in db.list_interval_schedules(active_only=True):
-        schedule_interval_job(application, interval)
-
-
-async def scheduled_post_job(context: ContextTypes.DEFAULT_TYPE):
-    schedule_id = int(context.job.data["schedule_id"])
-    sched = db.get_schedule(schedule_id)
-    if not sched or not sched["active"]:
-        return
-
-    ad = db.get_ad(int(sched["ad_id"]))
-    if not ad or not ad["active"]:
-        logger.warning("Agendamento %s ignorado: anúncio ausente ou desativado.", schedule_id)
-        return
-
-    logger.info("Executando agendamento #%s do anúncio #%s", schedule_id, ad["id"])
-    result = await post_ad_to_all(context.bot, ad)
-
-    if NOTIFY_SCHEDULED_POSTS:
+    payload = context.args[0] if context.args else ""
+    if payload.startswith("link_"):
+        token = payload[5:]
         try:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=(
-                    f"⏰ Agendamento executado\n\n"
-                    f"Anúncio: #{ad['id']} - {ad['title']}\n"
-                    f"Destinos: {result['total']}\n"
-                    f"Enviados: {result['success']}\n"
-                    f"Falhas: {result['error']}"
-                ),
+            result = await api_request(
+                "link",
+                {
+                    "token": token,
+                    "telegram_user_id": update.effective_user.id,
+                    "telegram_chat_id": update.effective_chat.id,
+                    "telegram_username": update.effective_user.username or "",
+                },
             )
-        except TelegramError:
-            pass
-
-
-async def interval_post_job(context: ContextTypes.DEFAULT_TYPE):
-    interval_id = int(context.job.data["interval_id"])
-    interval = db.get_interval_schedule(interval_id)
-    if not interval or not interval["active"]:
-        return
-
-    ad = db.get_ad(int(interval["ad_id"]))
-    if not ad or not ad["active"]:
-        logger.warning("Postagem automática %s ignorada: anúncio ausente ou desativado.", interval_id)
-        return
-
-    logger.info(
-        "Executando postagem automática #%s do anúncio #%s %s",
-        interval_id,
-        ad["id"],
-        interval_label(interval_minutes_from_row(interval)),
-    )
-    result = await post_ad_to_all(context.bot, ad)
-    db.mark_interval_ran(interval_id)
-
-    if NOTIFY_INTERVAL_POSTS:
-        try:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=(
-                    f"🔁 Postagem automática executada\n\n"
-                    f"Anúncio: #{ad['id']} - {ad['title']}\n"
-                    f"Intervalo: {interval_label(interval_minutes_from_row(interval))}\n"
-                    f"Destinos: {result['total']}\n"
-                    f"Enviados: {result['success']}\n"
-                    f"Falhas: {result['error']}"
-                ),
+            bonus = int(result.get("bonus", 0))
+            bonus_text = f" Você recebeu <b>{bonus} créditos</b> de bônus." if bonus > 0 else ""
+            await update.effective_message.reply_text(
+                "✅ <b>Perfil vinculado com sucesso.</b>" + bonus_text,
+                parse_mode="HTML",
             )
-        except TelegramError:
-            pass
-
-
-async def post_init(application: Application):
-    load_schedules(application)
-    try:
-        # Não mostrar comandos do bot no menu de / dos grupos/canais.
-        # O bot continua aceitando /registrar manualmente no grupo, mas o comando não fica sugerido para membros.
-        await application.bot.delete_my_commands(scope=BotCommandScopeDefault())
-        await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
-        await application.bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
-
-        # Mostrar comandos somente no privado do bot.
-        await application.bot.set_my_commands(
-            [
-                ("start", "Abrir o painel"),
-                ("panel", "Abrir o painel admin"),
-                ("id", "Ver seu ID do Telegram"),
-                ("testemoji", "Testar emoji premium"),
-                ("sincronizar", "Atualizar destinos já salvos"),
-                ("help", "Ajuda rápida"),
-                ("backup", "Baixar backup do banco"),
-            ],
-            scope=BotCommandScopeAllPrivateChats(),
-        )
-    except TelegramError as exc:
-        logger.warning("Não foi possível configurar/remover comandos do bot: %s", exc)
-
-
-# ============================================================
-# Registro e sincronização de destinos
-# ============================================================
-
-async def fetch_bot_membership(bot, chat_id: int):
-    """Retorna o ChatMember do próprio bot dentro do chat."""
-    me = await bot.get_me()
-    return await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
-
-
-def target_title_from_chat(chat) -> str:
-    return chat.title or getattr(chat, "username", None) or getattr(chat, "full_name", None) or str(chat.id)
-
-
-async def save_target_from_chat(bot, chat, *, approve_now: bool | None = None) -> tuple[bool, str]:
-    """
-    Registra/atualiza um grupo/canal onde o bot já está.
-    Isso evita precisar remover e adicionar o bot novamente depois de deploy no Render.
-    """
-    if not chat or chat.type == "private":
-        return False, "Use este comando dentro do grupo/canal que você quer registrar."
-
-    chat_id = int(chat.id)
-    try:
-        member = await fetch_bot_membership(bot, chat_id)
-    except TelegramError as e:
-        return False, f"Não consegui verificar o bot neste destino: {e}"
-
-    if member.status not in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
-        db.mark_target_inactive(chat_id)
-        return False, "O bot não parece estar ativo neste destino. Coloque o bot como membro/admin e tente novamente."
-
-    can_pin = bool(getattr(member, "can_pin_messages", False))
-    title = target_title_from_chat(chat)
-    db.upsert_target(chat_id, title, chat.type, can_pin)
-
-    if approve_now is not None:
-        db.set_target_approved(chat_id, approve_now)
-
-    target = db.get_target(chat_id)
-    status = "aprovado" if target and int(target["approved"]) else "pendente"
-    return True, (
-        f"Destino registrado/atualizado com sucesso.\n\n"
-        f"Nome: {title}\n"
-        f"Tipo: {chat.type}\n"
-        f"ID: {chat_id}\n"
-        f"Status: {status}\n"
-        f"Pode fixar: {'sim' if can_pin else 'não/indefinido'}"
-    )
-
-
-async def notify_owner_target_registered(bot, chat, text: str):
-    try:
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                "🔄 Destino registrado/atualizado sem remover o bot\n\n"
-                f"{text}\n\n"
-                "Use os botões abaixo se precisar aprovar ou rejeitar."
-            ),
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("✅ Aprovar", callback_data=f"tg:ok:{int(chat.id)}"),
-                        InlineKeyboardButton("❌ Rejeitar", callback_data=f"tg:no:{int(chat.id)}"),
-                    ]
-                ]
-            ),
-        )
-    except TelegramError as e:
-        logger.warning("Não consegui avisar o dono sobre /registrar: %s", e)
-
-
-async def sync_saved_targets(bot) -> dict:
-    """
-    Revalida destinos que já existem no banco.
-    Observação: a API do Telegram não permite listar todos os grupos onde o bot está.
-    Por isso, se o banco do Render for apagado, é necessário usar /registrar em cada destino.
-    """
-    targets = db.list_targets(limit=1000)
-    result = {"total": len(targets), "updated": 0, "inactive": 0, "errors": 0}
-
-    for target in targets:
-        chat_id = int(target["chat_id"])
-        try:
-            chat = await bot.get_chat(chat_id)
-            member = await fetch_bot_membership(bot, chat_id)
-            if member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
-                can_pin = bool(getattr(member, "can_pin_messages", False))
-                db.upsert_target(chat_id, target_title_from_chat(chat), chat.type, can_pin)
-                result["updated"] += 1
-            else:
-                db.mark_target_inactive(chat_id)
-                result["inactive"] += 1
-        except TelegramError as e:
-            logger.warning("Falha ao sincronizar destino %s: %s", chat_id, e)
-            db.mark_target_inactive(chat_id)
-            result["errors"] += 1
-
-    return result
-
-
-# ============================================================
-# Commands
-# ============================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # O painel nunca deve abrir em grupos/canais, mesmo se o dono digitar /start lá.
-    # Isso evita expor botões de criação de anúncio para membros do grupo.
-    if not update.effective_chat or update.effective_chat.type != "private":
-        return
-
-    if not await require_admin_update(update):
-        return
-
-    await update.message.reply_text(
-        f"🔥 Painel {AGENCY_NAME} Ads\n\n"
-        "Escolha uma opção abaixo:",
-        reply_markup=main_menu(),
-    )
-
-
-async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = user_id_from_update(update)
-    chat_id = update.effective_chat.id if update.effective_chat else ""
-    await update.message.reply_text(
-        f"🆔 Seu user_id: {uid}\n"
-        f"💬 Chat ID atual: {chat_id}"
-    )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_update(update):
-        return
-    await update.message.reply_text(
-        "Ajuda rápida:\n\n"
-        "/start ou /panel - abrir painel\n"
-        "/id - ver seu ID\n"
-        "/registrar - registrar/atualizar o grupo ou canal atual como destino\n"
-        "/sincronizar - atualizar os destinos já salvos no banco\n"
-        "/addadmin ID - adicionar admin extra, só dono\n"
-        "/removeadmin ID - remover admin extra, só dono\n"
-        "/backup - baixar backup do banco\n\n"
-        "Para cadastrar destino sem remover o bot: envie /registrar dentro do grupo/canal. "
-        "Depois aprove em Destinos pendentes, se ele não for aprovado automaticamente."
-    )
-async def testemoji_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_update(update):
-        return
-    context.user_data.clear()
-    context.user_data["flow"] = {"name": "emoji_test"}
-    await update.message.reply_text(
-        "Envie ou encaminhe agora uma mensagem com emoji Premium/custom emoji.\n\n"
-        "Eu vou verificar se o Telegram entregou o custom_emoji_id para o bot e vou fazer um teste de reenvio.\n\n"
-        "Dica: encaminhe a mensagem original. Copiar e colar pode perder as entities."
-    )
-
-
-async def register_target_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    if not chat:
-        return
-
-    if chat.type == "private":
-        if not await require_admin_update(update):
-            return
-        await msg.reply_text(
-            "Para registrar um destino sem remover e adicionar o bot novamente, faça assim:\n\n"
-            "1. Abra o grupo ou canal onde o bot já está.\n"
-            "2. Garanta que o bot é admin, principalmente se precisar postar/fixar.\n"
-            "3. Envie /registrar dentro desse grupo/canal.\n\n"
-            "Depois o destino aparecerá em Destinos pendentes ou será atualizado se já existir."
-        )
-        return
-
-    uid = user_id_from_update(update)
-    is_channel_post = bool(update.channel_post)
-
-    # Em grupos, exige que quem enviou o comando seja dono/admin do bot.
-    # Em canais, não existe effective_user; só admins do canal conseguem postar, então registra como pendente.
-    if not is_channel_post and not is_admin(uid):
-        if msg:
-            await msg.reply_text("Apenas o dono/admin do bot pode registrar este destino.")
-        return
-
-    approve_now = True if is_admin(uid) else None
-    ok, text = await save_target_from_chat(context.bot, chat, approve_now=approve_now)
-
-    if msg:
-        try:
-            await msg.reply_text(text)
-        except TelegramError:
-            pass
-
-    if ok:
-        await notify_owner_target_registered(context.bot, chat, text)
-
-
-async def sync_targets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_update(update):
-        return
-
-    msg = await update.message.reply_text("🔄 Sincronizando destinos já salvos no banco...")
-    result = await sync_saved_targets(context.bot)
-    await msg.edit_text(
-        "🔄 Sincronização concluída.\n\n"
-        f"Total no banco: {result['total']}\n"
-        f"Atualizados: {result['updated']}\n"
-        f"Inativos: {result['inactive']}\n"
-        f"Erros: {result['errors']}\n\n"
-        "Importante: o Telegram não permite ao bot descobrir sozinho grupos/canais que não estão no banco. "
-        "Se o banco do Render for apagado, envie /registrar dentro de cada grupo/canal uma vez."
-    )
-
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Operação cancelada.", reply_markup=main_menu())
-
-
-async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = user_id_from_update(update)
-    if uid != OWNER_ID:
-        await update.message.reply_text("Apenas o dono principal pode adicionar admins.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Use assim: /addadmin 123456789")
-        return
-
-    try:
-        new_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("ID inválido.")
-        return
-
-    db.add_admin(new_id, "Admin extra")
-    await update.message.reply_text(f"✅ Admin adicionado: {new_id}")
-
-
-async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = user_id_from_update(update)
-    if uid != OWNER_ID:
-        await update.message.reply_text("Apenas o dono principal pode remover admins.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Use assim: /removeadmin 123456789")
-        return
-
-    try:
-        old_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("ID inválido.")
-        return
-
-    if old_id == OWNER_ID:
-        await update.message.reply_text("Não dá para remover o dono principal.")
-        return
-
-    db.remove_admin(old_id)
-    await update.message.reply_text(f"✅ Admin removido: {old_id}")
-
-
-async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = user_id_from_update(update)
-    if uid != OWNER_ID:
-        await update.message.reply_text("Apenas o dono principal pode baixar backup.")
-        return
-
-    db_file = Path(DB_PATH)
-    if not db_file.exists():
-        await update.message.reply_text("Banco ainda não encontrado.")
-        return
-
-    with db_file.open("rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename=f"backup_sexy_prime_ads_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.db",
-            caption="Backup do banco SQLite do bot.",
-        )
-
-
-# ============================================================
-# Fluxos por mensagem
-# ============================================================
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin_update(update):
-        return
-
-    flow = context.user_data.get("flow")
-    if not flow:
-        if update.effective_chat and update.effective_chat.type == "private":
-            await update.message.reply_text("Use o painel para escolher uma ação.", reply_markup=main_menu())
-        return
-
-    name = flow.get("name")
-
-    if name == "emoji_test":
-        await run_emoji_diagnostic(update, context)
-        context.user_data.clear()
-    elif name == "new_ad":
-        await handle_new_ad_flow(update, context, flow)
-    elif name == "schedule_ad":
-        await handle_schedule_flow(update, context, flow)
-    elif name == "edit_ad":
-        await handle_edit_ad_flow(update, context, flow)
-
-
-async def handle_new_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: dict):
-    step = flow.get("step")
-    data = flow.setdefault("data", {})
-    msg = update.message
-
-    if step == "title":
-        if not msg.text:
-            await msg.reply_text("Envie um título em texto.")
-            return
-        data["title"] = msg.text.strip()[:80]
-        flow["step"] = "media"
-        await msg.reply_text(
-            "Agora envie o conteúdo do anúncio.\n\n"
-            "Você pode enviar:\n"
-            "• FOTO\n"
-            "• VÍDEO\n"
-            "• TEXTO pronto, inclusive com link, texto citado, negrito ou link embutido\n\n"
-            "Se enviar foto/vídeo com legenda, a legenda já será usada como descrição."
-        )
-        return
-
-    if step == "media":
-        if msg.photo:
-            data["media_type"] = "photo"
-            data["media_file_id"] = msg.photo[-1].file_id
-            caption_plain = visible_text(msg)
-            if caption_plain:
-                if len(caption_plain) > 1024:
-                    await msg.reply_text("A legenda da mídia passou de 1024 caracteres. Envie uma legenda menor.")
-                    return
-                data["description"], data["description_entities"] = rich_text_payload(msg)
-                flow["step"] = "button_text"
-                await msg.reply_text(
-                    "Mídia e legenda recebidas ✅\n\n"
-                    "Agora envie o texto do botão 1, ou envie: sem botão. Você pode adicionar até 5 botões URL."
-                )
-                return
-
-            flow["step"] = "description"
-            await msg.reply_text(
-                "Foto recebida ✅\n\n"
-                "Agora envie a descrição/legenda do anúncio.\n"
-                "Pode usar texto citado, negrito, links embutidos e emojis.\n"
-                "Limite: até 1024 caracteres visíveis."
-            )
+        except RuntimeError as exc:
+            await update.effective_message.reply_text(f"❌ {exc}")
             return
 
-        if msg.video:
-            data["media_type"] = "video"
-            data["media_file_id"] = msg.video.file_id
-            caption_plain = visible_text(msg)
-            if caption_plain:
-                if len(caption_plain) > 1024:
-                    await msg.reply_text("A legenda da mídia passou de 1024 caracteres. Envie uma legenda menor.")
-                    return
-                data["description"], data["description_entities"] = rich_text_payload(msg)
-                flow["step"] = "button_text"
-                await msg.reply_text(
-                    "Vídeo e legenda recebidos ✅\n\n"
-                    "Agora envie o texto do botão 1, ou envie: sem botão. Você pode adicionar até 5 botões URL."
-                )
-                return
-
-            flow["step"] = "description"
-            await msg.reply_text(
-                "Vídeo recebido ✅\n\n"
-                "Agora envie a descrição/legenda do anúncio.\n"
-                "Pode usar texto citado, negrito, links embutidos e emojis.\n"
-                "Limite: até 1024 caracteres visíveis."
-            )
-            return
-
-        text_plain = visible_text(msg)
-        if text_plain:
-            if len(text_plain) > 4096:
-                await msg.reply_text("Esse texto passou de 4096 caracteres. Envie uma versão menor.")
-                return
-            data["media_type"] = "text"
-            data["media_file_id"] = ""
-            data["description"], data["description_entities"] = rich_text_payload(msg)
-            flow["step"] = "button_text"
-            await msg.reply_text(
-                "Texto do anúncio recebido ✅\n\n"
-                "Agora envie o texto do botão 1.\n\n"
-            "Você pode adicionar até 5 botões URL neste anúncio.\n\n"
-                "Exemplos:\n"
-                "Ver modelo\n"
-                "Entrar no VIP\n"
-                "Falar com suporte\n\n"
-                "Ou envie: sem botão"
-            )
-            return
-
-        await msg.reply_text("Envie uma foto, vídeo ou mensagem de texto válida.")
-        return
-
-    if step == "description":
-        text_plain = visible_text(msg)
-        if not text_plain:
-            await msg.reply_text("Envie a descrição em texto.")
-            return
-        if len(text_plain) > 1024:
-            await msg.reply_text("A descrição passou de 1024 caracteres. Envie uma versão menor.")
-            return
-        data["description"], data["description_entities"] = rich_text_payload(msg)
-        flow["step"] = "button_text"
-        await msg.reply_text(
-            "Agora envie o texto do botão 1.\n\n"
-            "Você pode adicionar até 5 botões URL neste anúncio.\n\n"
-            "Exemplos:\n"
-            "Ver modelo\n"
-            "Entrar no VIP\n"
-            "Falar com suporte\n\n"
-            "Ou envie: sem botão"
-        )
-        return
-
-    button_step_match = re.match(r"^button(?:(\d+))?_(text|url|style)$", step or "")
-    if button_step_match:
-        number = int(button_step_match.group(1) or 1)
-        part = button_step_match.group(2)
-        text = (msg.text or "").strip()
-
-        if part == "text":
-            if not text:
-                await msg.reply_text(f"Envie o texto do botão {number} ou 'sem botão'.")
-                return
-
-            if is_skip_button_text(text, number):
-                clear_buttons_from(data, number)
-                flow["step"] = "pin"
-                await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
-                return
-
-            data[button_field(number, "text")] = text[:50]
-            flow["step"] = f"button{number}_url" if number > 1 else "button_url"
-            await msg.reply_text(
-                f"Agora envie o link do botão {number}.\n\n"
-                "Exemplo:\n"
-                "https://t.me/seulink\n"
-                "https://sxyprime.com"
-            )
-            return
-
-        if part == "url":
-            url = normalize_url(text)
-            if not is_valid_url(url):
-                await msg.reply_text("Link inválido. Envie um link começando com https:// ou http://")
-                return
-
-            data[button_field(number, "url")] = url
-            flow["step"] = f"button{number}_style" if number > 1 else "button_style"
-            await msg.reply_text(style_help_text(number))
-            return
-
-        if part == "style":
-            style = normalize_button_style(text)
-            if text.lower() and text.lower() not in BUTTON_STYLE_ALIASES:
-                await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
-                return
-            data[button_field(number, "style")] = style
-
-            next_number = number + 1
-            if next_number <= MAX_URL_BUTTONS:
-                flow["step"] = f"button{next_number}_text"
-                await msg.reply_text(
-                    f"Quer adicionar o botão URL {next_number}?\n\n"
-                    f"Envie o texto do botão {next_number}. Exemplo: Falar no suporte\n"
-                    "Ou envie: sem botão"
-                )
-                return
-
-            flow["step"] = "pin"
-            await msg.reply_text("Deseja fixar o anúncio depois de postar?", reply_markup=yes_no_keyboard("new:pin"))
-            return
+    await show_home(update, context)
 
 
-async def handle_schedule_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: dict):
-    msg = update.message
-    text = (msg.text or "").strip()
-
-    match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", text)
-    if not match:
-        await msg.reply_text("Horário inválido. Envie no formato HH:MM. Exemplo: 18:30")
-        return
-
-    hour = int(match.group(1))
-    minute = int(match.group(2))
-    ad_id = int(flow["ad_id"])
-
-    schedule_id = db.create_schedule(ad_id, hour, minute)
-    sched = db.get_schedule(schedule_id)
-    schedule_job(context.application, sched)
-
-    context.user_data.clear()
-
-    await msg.reply_text(
-        f"✅ Agendamento criado.\n\n"
-        f"Anúncio #{ad_id}\n"
-        f"Horário: {hour:02d}:{minute:02d}\n"
-        f"Dias: todos os dias\n"
-        f"Fuso: {TIMEZONE_NAME}",
-        reply_markup=main_menu(),
-    )
+async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_home(update, context)
 
 
-async def handle_edit_ad_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: dict):
-    msg = update.message
-    ad_id = int(flow["ad_id"])
-    field = flow["field"]
-
-    ad = db.get_ad(ad_id)
-    if not ad:
-        context.user_data.clear()
-        await msg.reply_text("Anúncio não encontrado.", reply_markup=main_menu())
-        return
-
-    if field == "media":
-        if msg.photo:
-            db.update_ad_field(ad_id, "media_type", "photo")
-            db.update_ad_field(ad_id, "media_file_id", msg.photo[-1].file_id)
-            if visible_text(msg):
-                if len(visible_text(msg)) > 1024:
-                    await msg.reply_text("A legenda passou de 1024 caracteres. Envie uma legenda menor.")
-                    return
-                desc_value, entities_value = rich_text_payload(msg)
-                db.update_ad_field(ad_id, "description", desc_value)
-                db.update_ad_field(ad_id, "description_entities", entities_value)
-        elif msg.video:
-            db.update_ad_field(ad_id, "media_type", "video")
-            db.update_ad_field(ad_id, "media_file_id", msg.video.file_id)
-            if visible_text(msg):
-                if len(visible_text(msg)) > 1024:
-                    await msg.reply_text("A legenda passou de 1024 caracteres. Envie uma legenda menor.")
-                    return
-                desc_value, entities_value = rich_text_payload(msg)
-                db.update_ad_field(ad_id, "description", desc_value)
-                db.update_ad_field(ad_id, "description_entities", entities_value)
-        elif visible_text(msg):
-            if len(visible_text(msg)) > 4096:
-                await msg.reply_text("Esse texto passou de 4096 caracteres. Envie uma versão menor.")
-                return
-            db.update_ad_field(ad_id, "media_type", "text")
-            db.update_ad_field(ad_id, "media_file_id", "")
-            desc_value, entities_value = rich_text_payload(msg)
-            db.update_ad_field(ad_id, "description", desc_value)
-            db.update_ad_field(ad_id, "description_entities", entities_value)
-        else:
-            await msg.reply_text("Envie uma foto, vídeo ou texto válido.")
-            return
-
-        context.user_data.clear()
-        await msg.reply_text("✅ Conteúdo do anúncio atualizado.", reply_markup=ad_keyboard(ad_id))
-        return
-
-    text = visible_text(msg)
-    button_text_fields = {button_field(n, "text") for n in range(1, MAX_URL_BUTTONS + 1)}
-    button_style_fields = {button_field(n, "style") for n in range(1, MAX_URL_BUTTONS + 1)}
-    if not text and field not in button_text_fields and field not in button_style_fields:
-        await msg.reply_text("Envie um texto válido.")
-        return
-
-    if field == "title":
-        db.update_ad_field(ad_id, "title", text[:80])
-    elif field == "description":
-        max_len = 4096 if ad["media_type"] == "text" else 1024
-        if len(text) > max_len:
-            await msg.reply_text(f"A descrição passou de {max_len} caracteres. Envie uma versão menor.")
-            return
-        desc_value, entities_value = rich_text_payload(msg)
-        db.update_ad_field(ad_id, "description", desc_value)
-        db.update_ad_field(ad_id, "description_entities", entities_value)
-    elif re.match(r"^button(?:(\d+))?_(text|url|style)$", field or ""):
-        match = re.match(r"^button(?:(\d+))?_(text|url|style)$", field)
-        number = int(match.group(1) or 1)
-        part = match.group(2)
-
-        if part == "text":
-            if is_skip_button_text(text, number):
-                db.update_ad_field(ad_id, button_field(number, "text"), "")
-                db.update_ad_field(ad_id, button_field(number, "url"), "")
-                db.update_ad_field(ad_id, button_field(number, "style"), "")
-            else:
-                db.update_ad_field(ad_id, button_field(number, "text"), text[:50])
-        elif part == "url":
-            url = normalize_url(text)
-            if text.lower() in {"remover", "pular", "sem botão", "sem botao", "sem url"}:
-                db.update_ad_field(ad_id, button_field(number, "url"), "")
-                db.update_ad_field(ad_id, button_field(number, "style"), "")
-            elif not is_valid_url(url):
-                await msg.reply_text("URL inválida. Envie começando com https:// ou http://")
-                return
-            else:
-                db.update_ad_field(ad_id, button_field(number, "url"), url)
-        elif part == "style":
-            if text.lower() in {"remover", "pular", "sem cor", "sem botão", "sem botao", "padrão", "padrao", "normal"}:
-                db.update_ad_field(ad_id, button_field(number, "style"), "")
-            elif text.lower() not in BUTTON_STYLE_ALIASES:
-                await msg.reply_text("Cor inválida. Use: padrão, azul, verde ou vermelho.")
-                return
-            else:
-                db.update_ad_field(ad_id, button_field(number, "style"), normalize_button_style(text))
-
-    context.user_data.clear()
-    await msg.reply_text("✅ Anúncio atualizado.", reply_markup=ad_keyboard(ad_id))
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("ad_flow", None)
+    await update.effective_message.reply_text("Envio cancelado.")
+    await show_home(update, context)
 
 
-# ============================================================
-# Callback Query
-# ============================================================
-
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
-
-    if not await require_admin_query(query):
+    if not query or not update.effective_user:
         return
-
+    await query.answer()
     data = query.data or ""
 
-    if data == "cancel":
-        context.user_data.clear()
-        await safe_edit(query, "Operação cancelada.", reply_markup=main_menu())
+    if data == "ads:home":
+        context.user_data.pop("ad_flow", None)
+        await show_home(update, context)
         return
 
-    if data == "menu:home":
-        context.user_data.clear()
-        await safe_edit(
-            query,
-            f"🔥 Painel {AGENCY_NAME} Ads\n\nEscolha uma opção abaixo:",
-            reply_markup=main_menu(),
-        )
+    profile = await profile_for(update.effective_user.id)
+    if not profile or not profile.get("linked"):
+        await query.message.reply_text(UNLINKED_MESSAGE, reply_markup=unlinked_keyboard())
         return
 
-    # ---------- criação: callbacks sim/não ----------
-    if data.startswith("new:pin:"):
-        flow = context.user_data.get("flow")
-        if not flow or flow.get("name") != "new_ad":
-            await safe_edit(query, "Fluxo expirado. Comece novamente.", reply_markup=main_menu())
-            return
-
-        flow["data"]["pin_message"] = int(data.split(":")[-1])
-        flow["step"] = "delete_previous"
-        await safe_edit(
-            query,
-            "Quando postar este anúncio, deseja apagar a última postagem anterior do bot no destino?",
-            reply_markup=yes_no_keyboard("new:delprev"),
-        )
-        return
-
-    if data.startswith("new:delprev:"):
-        flow = context.user_data.get("flow")
-        if not flow or flow.get("name") != "new_ad":
-            await safe_edit(query, "Fluxo expirado. Comece novamente.", reply_markup=main_menu())
-            return
-
-        flow["data"]["delete_previous"] = int(data.split(":")[-1])
-        ad_id = db.create_ad(flow["data"])
-        context.user_data.clear()
-        ad = db.get_ad(ad_id)
-
-        await safe_edit(
-            query,
-            f"✅ Anúncio criado com sucesso.\n\n{ad_text(ad)}",
-            reply_markup=ad_keyboard(ad_id),
-        )
-        return
-
-    # ---------- menu ----------
-    if data == "ad:new":
-        context.user_data["flow"] = {
-            "name": "new_ad",
-            "step": "title",
-            "data": {},
-        }
-        await safe_edit(
-            query,
-            "➕ Criar anúncio\n\n"
-            "Envie o título interno do anúncio.\n"
-            "Exemplo: Modelo Ana - VIP de hoje",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancel")]]),
-        )
-        return
-
-    if data == "ad:list":
-        ads = db.list_ads(limit=100)
-        if not ads:
-            await safe_edit(query, "Nenhum anúncio criado ainda.", reply_markup=back_home())
-            return
-
-        rows = []
-        for ad in ads:
-            status = "✅" if ad["active"] else "❌"
-            rows.append([InlineKeyboardButton(f"{status} #{ad['id']} - {short(ad['title'], 30)}", callback_data=f"ad:view:{ad['id']}")])
-        rows.append([InlineKeyboardButton("⬅️ Voltar ao painel", callback_data="menu:home")])
-        await safe_edit(query, "📋 Meus anúncios:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("ad:view:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-        await safe_edit(query, ad_text(ad), reply_markup=ad_keyboard(ad_id))
-        return
-
-    if data.startswith("ad:preview:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-
-        await send_ad_to_chat(context.bot, query.message.chat_id, ad, preview=True)
-        await query.message.reply_text("👆 Prévia do anúncio acima.", reply_markup=ad_keyboard(ad_id))
-        return
-
-    if data.startswith("ad:post:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-
-        approved = db.count_targets(approved=True, active=True)
-        if approved <= 0:
-            await safe_edit(
-                query,
-                "Nenhum destino aprovado ainda.\n\n"
-                "Adicione o bot como admin em grupos/canais e depois aprove em Destinos pendentes.",
-                reply_markup=back_home(),
-            )
-            return
-
-        await safe_edit(
-            query,
-            f"🚀 Confirmar postagem?\n\n"
-            f"Anúncio: #{ad_id} - {ad['title']}\n"
-            f"Destinos aprovados ativos: {approved}",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("✅ Confirmar postagem", callback_data=f"ad:postconfirm:{ad_id}")],
-                    [InlineKeyboardButton("⬅️ Cancelar", callback_data=f"ad:view:{ad_id}")],
-                ]
-            ),
-        )
-        return
-
-    if data.startswith("ad:postconfirm:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-
-        await safe_edit(query, "🚀 Postando anúncio nos destinos aprovados...")
-        result = await post_ad_to_all(context.bot, ad)
-
+    if data == "ads:balance":
+        wallet = profile.get("wallet") or {}
         await query.message.reply_text(
-            f"✅ Postagem finalizada.\n\n"
-            f"Anúncio: #{ad_id} - {ad['title']}\n"
-            f"Destinos: {result['total']}\n"
-            f"Enviados: {result['success']}\n"
-            f"Falhas: {result['error']}",
-            reply_markup=ad_keyboard(ad_id),
+            f"💳 Créditos ADS: <b>{int(wallet.get('credits', 0))}</b>\n"
+            f"⭐ Pontos: <b>{int(wallet.get('points', 0))}</b>\n\n"
+            "No painel da modelo, 200 pontos podem ser trocados por 5 créditos.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Voltar", callback_data="ads:home")]]),
         )
         return
 
-    if data.startswith("ad:schedule:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-
-        context.user_data["flow"] = {"name": "schedule_ad", "ad_id": ad_id}
-        await safe_edit(
-            query,
-            f"⏰ Agendar anúncio #{ad_id}\n\n"
-            "Envie o horário no formato HH:MM.\n"
-            "Exemplo: 18:30\n\n"
-            f"Fuso usado: {TIMEZONE_NAME}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancel")]]),
-        )
+    if data == "ads:mine":
+        try:
+            result = await api_request("my_ads", {"telegram_user_id": update.effective_user.id})
+            ads = result.get("ads") or []
+            if not ads:
+                text = "Você ainda não enviou anúncios."
+            else:
+                lines = ["📋 <b>Seus anúncios recentes</b>"]
+                for ad in ads[:10]:
+                    status = STATUS_LABELS.get(str(ad.get("status")), str(ad.get("status") or ""))
+                    line = f"\n#{int(ad.get('id', 0))} — <b>{status}</b>\n{str(ad.get('title') or 'Anúncio')}"
+                    if ad.get("rejection_reason"):
+                        line += f"\nMotivo: {str(ad.get('rejection_reason'))[:180]}"
+                    lines.append(line)
+                text = "\n".join(lines)
+            await query.message.reply_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Voltar", callback_data="ads:home")]]),
+            )
+        except RuntimeError as exc:
+            await query.message.reply_text(f"❌ {exc}")
         return
 
-    if data.startswith("ad:interval:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
+    if data == "ads:new":
+        if int((profile.get("wallet") or {}).get("credits", 0)) <= 0:
+            await query.message.reply_text(
+                "Você não possui créditos para enviar um anúncio. Resgate créditos no painel da modelo.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Abrir painel", url=SITE_PANEL_URL)]]),
+            )
             return
-
-        await safe_edit(
-            query,
-            f"🔁 Postagem automática do anúncio #{ad_id}\n\n"
-            "Escolha de quanto em quanto tempo o bot deve postar este anúncio.\n\n"
-            "Pode deixar vários anúncios diferentes rodando ao mesmo tempo. "
-            "Ao ativar aqui, o bot só substitui o automático antigo deste mesmo anúncio.\n\n"
-            "Importante: a primeira postagem automática acontece depois do intervalo escolhido. "
-            "Se quiser postar agora, use o botão 🚀 Postar agora.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("5 min", callback_data=f"interval:create:{ad_id}:m:5"),
-                        InlineKeyboardButton("10 min", callback_data=f"interval:create:{ad_id}:m:10"),
-                        InlineKeyboardButton("15 min", callback_data=f"interval:create:{ad_id}:m:15"),
-                    ],
-                    [
-                        InlineKeyboardButton("20 min", callback_data=f"interval:create:{ad_id}:m:20"),
-                        InlineKeyboardButton("25 min", callback_data=f"interval:create:{ad_id}:m:25"),
-                        InlineKeyboardButton("30 min", callback_data=f"interval:create:{ad_id}:m:30"),
-                    ],
-                    [
-                        InlineKeyboardButton("1h", callback_data=f"interval:create:{ad_id}:h:1"),
-                        InlineKeyboardButton("2h", callback_data=f"interval:create:{ad_id}:h:2"),
-                        InlineKeyboardButton("3h", callback_data=f"interval:create:{ad_id}:h:3"),
-                    ],
-                    [
-                        InlineKeyboardButton("4h", callback_data=f"interval:create:{ad_id}:h:4"),
-                        InlineKeyboardButton("6h", callback_data=f"interval:create:{ad_id}:h:6"),
-                        InlineKeyboardButton("12h", callback_data=f"interval:create:{ad_id}:h:12"),
-                    ],
-                    [InlineKeyboardButton("⬅️ Voltar", callback_data=f"ad:view:{ad_id}")],
-                ]
-            ),
-        )
-        return
-
-    if data.startswith("interval:create:"):
-        parts = data.split(":")
-        ad_id = int(parts[2])
-        # Compatibilidade com callback antigo: interval:create:<ad_id>:3 = 3 horas
-        if len(parts) >= 5 and parts[3] == "m":
-            interval_minutes = int(parts[4])
-        elif len(parts) >= 5 and parts[3] == "h":
-            interval_minutes = int(parts[4]) * 60
-        else:
-            interval_minutes = int(parts[3]) * 60
-
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-
-        old_interval_ids = db.disable_active_intervals_for_ad(ad_id)
-        for old_interval_id in old_interval_ids:
-            remove_interval_job(context.application, old_interval_id)
-
-        interval_id = db.create_interval_schedule(ad_id, interval_minutes)
-        interval = db.get_interval_schedule(interval_id)
-        schedule_interval_job(context.application, interval)
-
-        await safe_edit(
-            query,
-            f"✅ Postagem automática ativada.\n\n"
-            f"Anúncio: #{ad_id} - {ad['title']}\n"
-            f"Intervalo: {interval_label(interval_minutes)}\n\n"
-            "Você pode ativar outros anúncios também. O bot vai postar todos os automáticos ativos nos destinos aprovados.\n"
-            "A primeira postagem automática acontece depois desse intervalo.",
-            reply_markup=ad_keyboard(ad_id),
-        )
-        return
-
-    if data.startswith("ad:edit:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-        await safe_edit(query, f"✏️ Editar anúncio #{ad_id}\n\nEscolha o que deseja alterar:", reply_markup=ad_edit_keyboard(ad))
-        return
-
-    if data.startswith("ad:editfield:"):
-        parts = data.split(":")
-        ad_id = int(parts[2])
-        field = parts[3]
-
-        labels = {
-            "title": "novo título",
-            "description": "nova descrição",
+        context.user_data["ad_flow"] = {
+            "step": "media",
+            "source_nonce": secrets.token_urlsafe(24),
+            "buttons": [],
         }
-        for n in range(1, MAX_URL_BUTTONS + 1):
-            labels[button_field(n, "text")] = f"novo texto do botão {n}. Envie 'remover' para tirar o botão {n}"
-            labels[button_field(n, "url")] = f"nova URL do botão {n}. Envie 'remover' para tirar a URL {n}"
-            labels[button_field(n, "style")] = f"cor do botão {n}: padrão, azul, verde ou vermelho. Envie 'remover' para voltar ao padrão"
-
-        context.user_data["flow"] = {"name": "edit_ad", "ad_id": ad_id, "field": field}
-        await safe_edit(
-            query,
-            f"Envie o {labels.get(field, 'novo valor')} do anúncio #{ad_id}.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancel")]]),
+        await query.message.reply_text(
+            "Envie agora a <b>foto</b>, o <b>vídeo</b> ou o <b>texto</b> do anúncio.\n\nUse /cancelar para sair.",
+            parse_mode="HTML",
         )
         return
 
-    if data.startswith("ad:editmedia:"):
-        ad_id = int(data.split(":")[-1])
-        context.user_data["flow"] = {"name": "edit_ad", "ad_id": ad_id, "field": "media"}
-        await safe_edit(
-            query,
-            f"Envie a nova foto, vídeo ou texto pronto do anúncio #{ad_id}.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancel")]]),
-        )
+    flow = context.user_data.get("ad_flow")
+    if not isinstance(flow, dict):
+        await query.message.reply_text("Este envio expirou. Comece novamente.")
         return
 
-    if data.startswith("ad:togglepin:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-        db.update_ad_field(ad_id, "pin_message", 0 if ad["pin_message"] else 1)
-        ad = db.get_ad(ad_id)
-        await safe_edit(query, f"✏️ Editar anúncio #{ad_id}\n\nOpção atualizada.", reply_markup=ad_edit_keyboard(ad))
+    if data == "ads:no_button":
+        flow["buttons"] = []
+        flow["step"] = "confirm"
+        await send_preview(query.message, flow)
         return
 
-    if data.startswith("ad:toggledel:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-        db.update_ad_field(ad_id, "delete_previous", 0 if ad["delete_previous"] else 1)
-        ad = db.get_ad(ad_id)
-        await safe_edit(query, f"✏️ Editar anúncio #{ad_id}\n\nOpção atualizada.", reply_markup=ad_edit_keyboard(ad))
+    if data == "ads:confirm":
+        await confirm_submission(query.message, context, update.effective_user.id, flow)
         return
 
-    if data.startswith("ad:toggleactive:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-        db.update_ad_field(ad_id, "active", 0 if ad["active"] else 1)
-        ad = db.get_ad(ad_id)
-        await safe_edit(query, f"✏️ Editar anúncio #{ad_id}\n\nStatus atualizado.", reply_markup=ad_edit_keyboard(ad))
+    if data == "ads:cancel":
+        context.user_data.pop("ad_flow", None)
+        await query.message.reply_text("Envio cancelado.")
         return
 
-    if data.startswith("ad:delete:"):
-        ad_id = int(data.split(":")[-1])
-        ad = db.get_ad(ad_id)
-        if not ad:
-            await safe_edit(query, "Anúncio não encontrado.", reply_markup=back_home())
-            return
-        await safe_edit(
-            query,
-            (
-                f"🗑 Deseja excluir definitivamente o anúncio #{ad_id}?\n\n"
-                f"{ad['title']}\n\n"
-                "Isso remove o anúncio do painel e apaga os agendamentos/automáticos ligados a ele."
-            ),
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("✅ Sim, excluir de vez", callback_data=f"ad:deleteconfirm:{ad_id}")],
-                    [InlineKeyboardButton("⬅️ Cancelar", callback_data=f"ad:view:{ad_id}")],
-                ]
-            ),
-        )
+
+async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.effective_message or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    flow = context.user_data.get("ad_flow")
+    if not isinstance(flow, dict):
         return
 
-    if data.startswith("ad:deleteconfirm:"):
-        ad_id = int(data.split(":")[-1])
-        result = db.delete_ad_hard(ad_id)
-        if not result.get("deleted"):
-            await safe_edit(query, "Anúncio não encontrado ou já excluído.", reply_markup=back_home())
-            return
+    message = update.effective_message
+    step = str(flow.get("step") or "")
 
-        for schedule_id in result.get("schedule_ids", []):
-            remove_schedule_job(context.application, schedule_id)
-        for interval_id in result.get("interval_ids", []):
-            remove_interval_job(context.application, interval_id)
-
-        await safe_edit(
-            query,
-            (
-                f"✅ Anúncio #{ad_id} excluído de vez.\n\n"
-                f"Agendamentos removidos: {len(result.get('schedule_ids', []))}\n"
-                f"Automáticos removidos: {len(result.get('interval_ids', []))}"
-            ),
-            reply_markup=back_home(),
-        )
-        return
-
-    # ---------- targets ----------
-    if data == "tg:pending":
-        targets = db.list_targets(approved=False, active=True, limit=20)
-        if not targets:
-            await safe_edit(query, "Nenhum destino pendente.", reply_markup=back_home())
-            return
-
-        text = "📍 Destinos pendentes:\n\n"
-        rows = []
-        for t in targets:
-            text += f"• {t['chat_title']} ({t['chat_type']})\nID: {t['chat_id']}\n\n"
-            rows.append(
-                [
-                    InlineKeyboardButton(f"✅ Aprovar {short(t['chat_title'], 18)}", callback_data=f"tg:ok:{t['chat_id']}"),
-                    InlineKeyboardButton("❌ Rejeitar", callback_data=f"tg:no:{t['chat_id']}"),
-                ]
+    if step == "media":
+        if message.photo:
+            photo = message.photo[-1]
+            flow.update(
+                {
+                    "media_type": "photo",
+                    "telegram_file_id": photo.file_id,
+                    "media_file_name": "anuncio.jpg",
+                    "media_mime": "image/jpeg",
+                    "body_text": (message.caption or "").strip(),
+                    "body_entities": json.dumps([e.to_dict() for e in (message.caption_entities or [])], ensure_ascii=False),
+                }
             )
-        rows.append([InlineKeyboardButton("⬅️ Voltar", callback_data="menu:home")])
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data == "tg:approved":
-        targets = db.list_targets(approved=True, active=True, limit=30)
-        if not targets:
-            await safe_edit(query, "Nenhum destino aprovado ativo.", reply_markup=back_home())
+        elif message.video:
+            flow.update(
+                {
+                    "media_type": "video",
+                    "telegram_file_id": message.video.file_id,
+                    "media_file_name": message.video.file_name or "anuncio.mp4",
+                    "media_mime": message.video.mime_type or "video/mp4",
+                    "body_text": (message.caption or "").strip(),
+                    "body_entities": json.dumps([e.to_dict() for e in (message.caption_entities or [])], ensure_ascii=False),
+                }
+            )
+        elif message.text:
+            flow.update(
+                {
+                    "media_type": "text",
+                    "telegram_file_id": "",
+                    "media_file_name": "",
+                    "media_mime": "",
+                    "body_text": message.text.strip(),
+                    "body_entities": json.dumps([e.to_dict() for e in (message.entities or [])], ensure_ascii=False),
+                }
+            )
+        else:
+            await message.reply_text("Envie uma foto, um vídeo ou uma mensagem de texto.")
             return
 
-        text = "✅ Destinos aprovados ativos:\n\n"
-        rows = []
-        for t in targets:
-            text += f"• {t['chat_title']} ({t['chat_type']})\nID: {t['chat_id']}\n\n"
-            rows.append([InlineKeyboardButton(f"⛔ Desativar {short(t['chat_title'], 24)}", callback_data=f"tg:disable:{t['chat_id']}")])
-        rows.append([InlineKeyboardButton("⬅️ Voltar", callback_data="menu:home")])
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(rows))
+        if flow.get("media_type") in {"photo", "video"} and not flow.get("body_text"):
+            flow["step"] = "caption"
+            await message.reply_text("Agora envie a legenda/texto do anúncio. Envie apenas - para deixar sem legenda.")
+        else:
+            await ask_button(message, flow)
         return
 
-    if data.startswith("tg:ok:"):
-        chat_id = int(data.split(":")[-1])
-        db.set_target_approved(chat_id, True)
-        await safe_edit(query, f"✅ Destino aprovado:\n{chat_id}", reply_markup=back_home())
-        return
-
-    if data.startswith("tg:no:"):
-        chat_id = int(data.split(":")[-1])
-        db.set_target_approved(chat_id, False)
-        db.set_target_active(chat_id, False)
-        await safe_edit(query, f"❌ Destino rejeitado/desativado:\n{chat_id}", reply_markup=back_home())
-        return
-
-    if data.startswith("tg:disable:"):
-        chat_id = int(data.split(":")[-1])
-        db.set_target_active(chat_id, False)
-        await safe_edit(query, f"⛔ Destino desativado:\n{chat_id}", reply_markup=back_home())
-        return
-
-    if data == "tg:sync":
-        await safe_edit(query, "🔄 Sincronizando destinos já salvos no banco...")
-        result = await sync_saved_targets(context.bot)
-        await safe_edit(
-            query,
-            "🔄 Sincronização concluída.\n\n"
-            f"Total no banco: {result['total']}\n"
-            f"Atualizados: {result['updated']}\n"
-            f"Inativos: {result['inactive']}\n"
-            f"Erros: {result['errors']}\n\n"
-            "Se o banco do Render for apagado, use /registrar dentro dos grupos/canais uma vez.",
-            reply_markup=back_home(),
-        )
-        return
-
-
-    # ---------- schedules ----------
-    if data == "sched:list":
-        schedules = db.list_schedules(active_only=False)
-        if not schedules:
-            await safe_edit(query, "Nenhum agendamento criado ainda.", reply_markup=back_home())
+    if step == "caption":
+        if not message.text:
+            await message.reply_text("Envie a legenda em texto ou apenas - para deixar sem legenda.")
             return
-
-        text = "⏰ Agendamentos:\n\n"
-        rows = []
-        for s in schedules:
-            status = "✅" if s["active"] else "❌"
-            text += (
-                f"{status} #{s['id']} - {s['hour']:02d}:{s['minute']:02d}\n"
-                f"Anúncio: #{s['ad_id']} - {s['ad_title'] or 'removido'}\n\n"
-            )
-            if s["active"]:
-                rows.append([InlineKeyboardButton(f"⛔ Desativar agendamento #{s['id']}", callback_data=f"sched:disable:{s['id']}")])
-        rows.append([InlineKeyboardButton("⬅️ Voltar", callback_data="menu:home")])
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(rows))
+        flow["body_text"] = "" if message.text.strip() == "-" else message.text.strip()
+        flow["body_entities"] = json.dumps([e.to_dict() for e in (message.entities or [])], ensure_ascii=False)
+        await ask_button(message, flow)
         return
 
-    if data.startswith("sched:disable:"):
-        schedule_id = int(data.split(":")[-1])
-        db.set_schedule_active(schedule_id, False)
-        remove_schedule_job(context.application, schedule_id)
-        await safe_edit(query, f"✅ Agendamento #{schedule_id} desativado.", reply_markup=back_home())
-        return
-
-    # ---------- intervalos automáticos ----------
-    if data == "interval:list":
-        intervals = db.list_interval_schedules(active_only=False)
-        if not intervals:
-            await safe_edit(
-                query,
-                "🔁 Nenhuma postagem automática criada ainda.\n\n"
-                "Para ativar: Meus anúncios > escolha o anúncio > 🔁 Automático.",
-                reply_markup=back_home(),
-            )
+    if step == "button_text":
+        if not message.text:
+            await message.reply_text("Envie o texto do botão.")
             return
-
-        text = "🔁 Postagens automáticas:\n\n"
-        rows = []
-        for i in intervals:
-            status = "✅" if i["active"] else "❌"
-            last_run = i["last_run_at"] or "ainda não executou"
-            text += (
-                f"{status} #{i['id']} - {interval_label(interval_minutes_from_row(i))}\n"
-                f"Anúncio: #{i['ad_id']} - {i['ad_title'] or 'removido'}\n"
-                f"Última execução: {last_run}\n\n"
-            )
-            if i["active"]:
-                rows.append([InlineKeyboardButton(f"⛔ Parar automático #{i['id']}", callback_data=f"interval:disable:{i['id']}")])
-        rows.append([InlineKeyboardButton("⬅️ Voltar", callback_data="menu:home")])
-        await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("interval:disable:"):
-        interval_id = int(data.split(":")[-1])
-        db.set_interval_schedule_active(interval_id, False)
-        remove_interval_job(context.application, interval_id)
-        await safe_edit(query, f"✅ Postagem automática #{interval_id} parada.", reply_markup=back_home())
-        return
-
-    # ---------- stats / settings ----------
-    if data == "stats":
-        st = db.stats_today()
-        text = (
-            "📊 Estatísticas\n\n"
-            f"Anúncios cadastrados: {db.count_ads()}\n"
-            f"Destinos pendentes: {db.count_targets(approved=False, active=True)}\n"
-            f"Destinos aprovados ativos: {db.count_targets(approved=True, active=True)}\n"
-            f"Agendamentos ativos: {db.count_schedules(active=True)}\n"
-            f"Postagens automáticas ativas: {db.count_interval_schedules(active=True)}\n\n"
-            f"Postagens hoje: {st['total']}\n"
-            f"Enviadas hoje: {st['success']}\n"
-            f"Falhas hoje: {st['error']}\n"
-        )
-
-        errors = db.recent_errors(limit=5)
-        if errors:
-            text += "\nÚltimas falhas:\n"
-            for e in errors:
-                text += f"• {short(e['chat_title'] or e['chat_id'], 25)}: {short(e['error_message'], 60)}\n"
-
-        await safe_edit(query, text, reply_markup=back_home())
-        return
-
-    if data == "settings":
-        admins = db.list_admins()
-        admins_text = "\n".join([f"• {a['user_id']} - {a['role']}" for a in admins]) or "Nenhum"
-        text = (
-            "⚙️ Configurações atuais\n\n"
-            f"Agência: {AGENCY_NAME}\n"
-            f"Dono: {OWNER_ID}\n"
-            f"Fuso: {TIMEZONE_NAME}\n"
-            f"Suporte: {SUPPORT_URL}\n"
-            f"Banco: {DB_PATH}\n\n"
-            f"Admins ativos:\n{admins_text}\n\n"
-            "Comandos:\n"
-            "/addadmin ID\n"
-            "/removeadmin ID\n"
-            "/backup"
-        )
-        await safe_edit(query, text, reply_markup=back_home())
-        return
-
-    await safe_edit(query, "Ação não reconhecida.", reply_markup=main_menu())
-
-
-# ============================================================
-# Detectar quando o bot entra/sai de grupos/canais
-# ============================================================
-
-async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    event = update.my_chat_member
-    if not event:
-        return
-
-    chat = event.chat
-    old = event.old_chat_member
-    new = event.new_chat_member
-
-    old_status = getattr(old, "status", None)
-    status = new.status
-    chat_id = int(chat.id)
-    title = chat.title or chat.username or str(chat_id)
-    chat_type = chat.type
-
-    active_statuses = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
-    inactive_statuses = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
-
-    target_before = db.get_target(chat_id)
-    was_inactive_before_update = old_status in inactive_statuses
-    was_active_before_update = old_status in active_statuses
-
-    if status in active_statuses:
-        can_pin = bool(getattr(new, "can_pin_messages", False))
-        db.upsert_target(chat_id, title, chat_type, can_pin)
-
-        # Só manda tela de aprovação quando o bot realmente acabou de entrar no grupo/canal.
-        # Alteração de permissão, tirar admin, colocar admin ou update após deploy NÃO deve gerar
-        # novo pedido de aprovação no PV do dono.
-        is_real_new_entry = (
-            target_before is None
-            and (was_inactive_before_update or old_status is None)
-            and not was_active_before_update
-        ) or (
-            target_before is not None
-            and not int(target_before["active"])
-            and was_inactive_before_update
-        )
-
-        if not is_real_new_entry:
-            logger.info(
-                "Destino atualizado sem pedir aprovação: %s | old=%s new=%s can_pin=%s",
-                chat_id,
-                old_status,
-                status,
-                can_pin,
-            )
+        text = message.text.strip()
+        if text.lower() in {"sem botão", "sem botao", "-"}:
+            flow["buttons"] = []
+            flow["step"] = "confirm"
+            await send_preview(message, flow)
             return
+        if len(text) > 100:
+            await message.reply_text("O texto do botão deve ter no máximo 100 caracteres.")
+            return
+        flow["pending_button_text"] = text
+        flow["step"] = "button_url"
+        await message.reply_text("Envie a URL completa do botão, começando com https://")
+        return
 
-        text = (
-            "📍 Novo destino detectado\n\n"
-            f"Nome: {title}\n"
-            f"Tipo: {chat_type}\n"
-            f"ID: {chat_id}\n"
-            f"Status do bot: {status}\n"
-            f"Pode fixar: {'sim' if can_pin else 'não/indefinido'}\n\n"
-            "Deseja aprovar para receber anúncios?"
+    if step == "button_url":
+        if not message.text or not valid_url(message.text):
+            await message.reply_text("URL inválida. Envie uma URL começando com http:// ou https://")
+            return
+        buttons = list(flow.get("buttons") or [])
+        buttons.append({"text": flow.pop("pending_button_text", "Abrir"), "url": message.text.strip()})
+        flow["buttons"] = buttons[:MAX_BUTTONS]
+        flow["step"] = "confirm"
+        await send_preview(message, flow)
+        return
+
+
+async def ask_button(message, flow: dict[str, Any]) -> None:
+    flow["step"] = "button_text"
+    await message.reply_text(
+        "Envie o texto do botão do anúncio.\nEnvie <b>sem botão</b> para continuar sem URL.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Continuar sem botão", callback_data="ads:no_button")]]),
+    )
+
+
+def ad_markup(flow: dict[str, Any], confirm: bool = False) -> InlineKeyboardMarkup | None:
+    rows = []
+    for button in list(flow.get("buttons") or [])[:MAX_BUTTONS]:
+        if button.get("text") and button.get("url"):
+            rows.append([InlineKeyboardButton(str(button["text"]), url=str(button["url"]))])
+    if confirm:
+        rows.append(
+            [
+                InlineKeyboardButton("✅ Enviar para aprovação", callback_data="ads:confirm"),
+                InlineKeyboardButton("Cancelar", callback_data="ads:cancel"),
+            ]
         )
-
-        try:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=text,
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton("✅ Aprovar", callback_data=f"tg:ok:{chat_id}"),
-                            InlineKeyboardButton("❌ Rejeitar", callback_data=f"tg:no:{chat_id}"),
-                        ]
-                    ]
-                ),
-            )
-        except TelegramError as e:
-            logger.warning("Não consegui avisar o dono sobre novo destino: %s", e)
-
-    elif status in inactive_statuses:
-        db.mark_target_inactive(chat_id)
-        try:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=f"⚠️ Bot removido ou bloqueado no destino:\n\n{title}\nID: {chat_id}",
-            )
-        except TelegramError:
-            pass
-
-    else:
-        # Restrição/permissão limitada não deve gerar pedido de aprovação.
-        # Mantemos fora dos destinos ativos para não tentar postar onde o bot não consegue atuar.
-        db.mark_target_inactive(chat_id)
-        logger.info("Destino marcado como inativo por status do bot: %s | status=%s", chat_id, status)
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
-# ============================================================
-# Error handler
-# ============================================================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Erro não tratado:", exc_info=context.error)
+async def send_preview(message, flow: dict[str, Any]) -> None:
+    text = str(flow.get("body_text") or "")
+    markup = ad_markup(flow, confirm=False)
+    media_type = flow.get("media_type")
+    file_id = flow.get("telegram_file_id")
+    await message.reply_text("👁 <b>Prévia do anúncio</b>", parse_mode="HTML")
     try:
-        if OWNER_ID:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=f"⚠️ Erro no bot:\n{type(context.error).__name__}: {context.error}",
-            )
+        if media_type == "photo" and file_id:
+            await message.reply_photo(file_id, caption=text[:1024] or None, reply_markup=markup)
+        elif media_type == "video" and file_id:
+            await message.reply_video(file_id, caption=text[:1024] or None, reply_markup=markup)
+        else:
+            await message.reply_text(text or "Anúncio sem texto", reply_markup=markup)
+    except TelegramError as exc:
+        logger.warning("Falha ao exibir prévia: %s", exc)
+        await message.reply_text(text or "Mídia anexada ao anúncio.", reply_markup=markup)
+
+    await message.reply_text(
+        "O anúncio será enviado ao painel administrativo e só será publicado depois da aprovação.",
+        reply_markup=InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✅ Enviar para aprovação", callback_data="ads:confirm"),
+                InlineKeyboardButton("Cancelar", callback_data="ads:cancel"),
+            ]]
+        ),
+    )
+
+
+async def download_media(context: ContextTypes.DEFAULT_TYPE, flow: dict[str, Any]) -> str | None:
+    file_id = str(flow.get("telegram_file_id") or "")
+    if not file_id:
+        return None
+    suffix = Path(str(flow.get("media_file_name") or "media.bin")).suffix or ".bin"
+    temp = tempfile.NamedTemporaryFile(prefix="sxp_ad_", suffix=suffix, delete=False)
+    temp_path = temp.name
+    temp.close()
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        await tg_file.download_to_drive(custom_path=temp_path)
+        return temp_path
+    except Exception as exc:
+        logger.warning("Não foi possível baixar mídia para o painel: %s", exc)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        return None
+
+
+async def confirm_submission(message, context: ContextTypes.DEFAULT_TYPE, telegram_user_id: int, flow: dict[str, Any]) -> None:
+    await message.reply_text("Enviando anúncio para análise...")
+    media_path = None
+    try:
+        media_path = await download_media(context, flow)
+        result = await api_submit_ad(
+            {
+                "action": "submit_ad",
+                "telegram_user_id": telegram_user_id,
+                "title": "Anúncio enviado pelo Bot ADS",
+                "media_type": flow.get("media_type", "text"),
+                "telegram_file_id": flow.get("telegram_file_id", ""),
+                "body_text": flow.get("body_text", ""),
+                "body_entities": flow.get("body_entities", ""),
+                "source_nonce": flow.get("source_nonce", secrets.token_urlsafe(24)),
+                "buttons_json": flow.get("buttons", []),
+            },
+            media_path,
+            str(flow.get("media_file_name") or "media"),
+            str(flow.get("media_mime") or "application/octet-stream"),
+        )
+        wallet = result.get("wallet") or {}
+        ad = result.get("ad") or {}
+        await message.reply_text(
+            "✅ <b>Anúncio enviado para aprovação.</b>\n\n"
+            f"Protocolo: <b>#{int(ad.get('id', 0))}</b>\n"
+            f"Crédito reservado: <b>{int(ad.get('credits_reserved', 0))}</b>\n"
+            f"Saldo disponível: <b>{int(wallet.get('credits', 0))}</b>",
+            parse_mode="HTML",
+            reply_markup=linked_keyboard(telegram_user_id == OWNER_ID),
+        )
+        context.user_data.pop("ad_flow", None)
+    except RuntimeError as exc:
+        await message.reply_text(f"❌ {exc}")
+    except Exception as exc:
+        logger.exception("Falha ao enviar anúncio")
+        await message.reply_text("❌ Não foi possível enviar o anúncio agora. Tente novamente.")
+    finally:
+        if media_path:
+            try:
+                os.unlink(media_path)
+            except OSError:
+                pass
+
+
+async def register_chat(chat, bot) -> None:
+    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}:
+        return
+    try:
+        me = await bot.get_chat_member(chat.id, bot.id)
+        can_pin = bool(
+            getattr(me, "can_pin_messages", False)
+            or getattr(me, "can_manage_chat", False)
+            or getattr(me, "can_edit_messages", False)
+        )
+        await api_request(
+            "register_destination",
+            {
+                "chat_id": chat.id,
+                "title": chat.title or str(chat.id),
+                "type": chat.type,
+                "username": chat.username or "",
+                "can_pin": can_pin,
+            },
+        )
+        logger.info("Destino registrado: %s (%s)", chat.title, chat.id)
+    except Exception as exc:
+        logger.warning("Falha ao registrar destino %s: %s", chat.id, exc)
+
+
+async def registrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}:
+        await update.effective_message.reply_text("Use este comando no grupo ou canal que será cadastrado.")
+        return
+    await register_chat(update.effective_chat, context.bot)
+    try:
+        await update.effective_message.reply_text("Destino enviado para aprovação no painel administrativo.")
     except TelegramError:
         pass
 
 
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    changed = update.my_chat_member
+    if not changed:
+        return
+    old_status = changed.old_chat_member.status
+    new_status = changed.new_chat_member.status
+    active = new_status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
+    was_active = old_status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
+    if active and not was_active:
+        await register_chat(changed.chat, context.bot)
+
+
+def destination_keyboard(buttons: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
+    rows = []
+    for button in buttons[:MAX_BUTTONS]:
+        text = str(button.get("button_text") or button.get("text") or "").strip()
+        url = str(button.get("button_url") or button.get("url") or "").strip()
+        style = str(button.get("button_style") or button.get("style") or "").strip().lower()
+        if text and valid_url(url):
+            if style in {"primary", "success", "danger"}:
+                rows.append([InlineKeyboardButton(text, url=url, api_kwargs={"style": style})])
+            else:
+                rows.append([InlineKeyboardButton(text, url=url)])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def send_job_to_destination(context: ContextTypes.DEFAULT_TYPE, job: dict[str, Any], destination: dict[str, Any]) -> dict[str, Any]:
+    schedule = job.get("schedule") or {}
+    ad = job.get("ad") or {}
+    destination_id = int(destination.get("id") or 0)
+    chat_id = int(destination.get("telegram_chat_id") or 0)
+    result: dict[str, Any] = {"destination_id": destination_id, "chat_id": chat_id, "ok": False}
+
+    try:
+        if bool(int(schedule.get("delete_previous") or 0)):
+            server_previous_id = int(destination.get("previous_message_id") or 0)
+            previous = (chat_id, server_previous_id) if server_previous_id > 0 else last_post(destination_id)
+            if previous:
+                try:
+                    await context.bot.delete_message(chat_id=previous[0], message_id=previous[1])
+                except (BadRequest, Forbidden):
+                    pass
+                clear_last_post(destination_id)
+
+        text = str(ad.get("body_text") or "")
+        media_type = str(ad.get("media_type") or "text")
+        telegram_file_id = str(ad.get("telegram_file_id") or "")
+        media_url = str(ad.get("media_url") or "")
+        media_source = telegram_file_id or media_url
+        markup = destination_keyboard(list(ad.get("buttons") or []))
+
+        if media_type == "photo" and media_source:
+            sent = await context.bot.send_photo(chat_id=chat_id, photo=media_source, caption=text[:1024] or None, reply_markup=markup)
+        elif media_type == "video" and media_source:
+            sent = await context.bot.send_video(chat_id=chat_id, video=media_source, caption=text[:1024] or None, reply_markup=markup, supports_streaming=True)
+        else:
+            if not text:
+                raise RuntimeError("Anúncio sem texto ou mídia.")
+            sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, disable_web_page_preview=False)
+
+        save_last_post(destination_id, chat_id, sent.message_id)
+        if bool(int(schedule.get("pin_message") or 0)) and bool(int(destination.get("can_pin") or 0)):
+            try:
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+            except (BadRequest, Forbidden) as exc:
+                logger.warning("Não foi possível fixar em %s: %s", chat_id, exc)
+
+        result.update({"ok": True, "message_id": sent.message_id})
+    except Exception as exc:
+        logger.warning("Falha no destino %s: %s", chat_id, exc)
+        result["error"] = str(exc)[:1000]
+    return result
+
+
+async def job_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        response = await api_request("next_job")
+        job = response.get("job")
+        if not job:
+            return
+        destinations = list(job.get("destinations") or [])
+        schedule = job.get("schedule") or {}
+        schedule_id = int(schedule.get("id") or 0)
+        lease_token = str(job.get("lease_token") or "")
+        run_number = int(job.get("run_number") or (int(schedule.get("runs_completed") or 0) + 1))
+        existing = {
+            int(item.get("destination_id") or 0): {
+                "destination_id": int(item.get("destination_id") or 0),
+                "chat_id": int(item.get("chat_id") or 0),
+                "message_id": int(item.get("message_id") or 0),
+                "ok": True,
+            }
+            for item in list(job.get("existing_results") or [])
+            if int(item.get("destination_id") or 0) > 0
+        }
+        results = []
+        for destination in destinations:
+            destination_id = int(destination.get("id") or 0)
+            if destination_id in existing:
+                results.append(existing[destination_id])
+                continue
+            result = await send_job_to_destination(context, job, destination)
+            results.append(result)
+            try:
+                await api_request(
+                    "checkpoint_job",
+                    {
+                        "schedule_id": schedule_id,
+                        "lease_token": lease_token,
+                        "run_number": run_number,
+                        "result": result,
+                    },
+                )
+            except Exception as checkpoint_error:
+                logger.warning("Falha ao registrar checkpoint do destino %s: %s", destination_id, checkpoint_error)
+            await asyncio.sleep(0.15)
+        await api_request(
+            "complete_job",
+            {
+                "schedule_id": schedule_id,
+                "lease_token": lease_token,
+                "results": results,
+            },
+        )
+    except Exception as exc:
+        logger.exception("Worker de anúncios falhou: %s", exc)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Erro não tratado no bot", exc_info=context.error)
+
+
 def build_application() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("Configure BOT_TOKEN no arquivo .env ou nas Environment Variables do Render")
-    if not OWNER_ID:
-        raise RuntimeError("Configure OWNER_ID no arquivo .env ou nas Environment Variables do Render")
-
-    defaults = Defaults(tzinfo=TZ)
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .defaults(defaults)
-        .post_init(post_init)
-        .build()
-    )
-
-    # Comandos administrativos só funcionam no privado do bot.
-    # Em grupos/canais, /start e /panel são ignorados para não mostrar painel de anúncios aos membros.
-    private_only = filters.ChatType.PRIVATE
-    app.add_handler(CommandHandler("start", start, filters=private_only))
-    app.add_handler(CommandHandler("panel", panel, filters=private_only))
-    app.add_handler(CommandHandler("id", get_id, filters=private_only))
-    app.add_handler(CommandHandler(["testemoji", "testeemoji"], testemoji_cmd, filters=private_only))
-    app.add_handler(CommandHandler("help", help_cmd, filters=private_only))
-    app.add_handler(CommandHandler("sincronizar", sync_targets_cmd, filters=private_only))
-    app.add_handler(CommandHandler("cancel", cancel_cmd, filters=private_only))
-    app.add_handler(CommandHandler("addadmin", add_admin_cmd, filters=private_only))
-    app.add_handler(CommandHandler("removeadmin", remove_admin_cmd, filters=private_only))
-    app.add_handler(CommandHandler("backup", backup_cmd, filters=private_only))
-
-    # Único comando aceito em grupo/canal, mas ele não aparece no menu de /.
-    app.add_handler(CommandHandler("registrar", register_target_cmd))
-
-    app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(CallbackQueryHandler(buttons))
-
-    # Fluxos de criação/edição de anúncio só no privado.
-    app.add_handler(MessageHandler(private_only & (filters.PHOTO | filters.VIDEO | filters.TEXT) & ~filters.COMMAND, handle_message))
-
+    validate_environment()
+    runtime_db().close()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("painel", panel_command))
+    app.add_handler(CommandHandler("cancelar", cancel_command))
+    app.add_handler(CommandHandler("registrar", registrar_command))
+    app.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^ads:"))
+    app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.TEXT) & ~filters.COMMAND, private_message_handler))
     app.add_error_handler(error_handler)
+    app.job_queue.run_repeating(job_worker, interval=JOB_INTERVAL_SECONDS, first=10, name="bot-ads-worker")
     return app
 
 
-def main_polling():
+def main() -> None:
     app = build_application()
-    logger.info("Bot iniciado em polling. Agência: %s | Dono: %s | Fuso: %s", AGENCY_NAME, OWNER_ID, TIMEZONE_NAME)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-async def run_webhook_server():
-    if not WEBHOOK_URL:
-        raise RuntimeError("Configure WEBHOOK_URL com a URL pública do Render. Ex: https://sexy-prime-ads.onrender.com")
-
-    application = build_application()
-
-    await application.initialize()
-    await post_init(application)
-    await application.start()
-
-    full_webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-    await application.bot.set_webhook(
-        url=full_webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-    )
-
-    async def health(_request: web.Request):
-        return web.json_response(
-            {
-                "ok": True,
-                "bot": "Sexy Prime Ads",
-                "mode": "webhook",
-                "webhook_path": WEBHOOK_PATH,
-                "time": now_iso(),
-            }
-        )
-
-    async def telegram_webhook(request: web.Request):
-        # GET serve para cron/monitoramento acordar o Render sem enviar update falso.
-        if request.method == "GET":
-            return await health(request)
-
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-
-        update = Update.de_json(payload, application.bot)
-        await application.process_update(update)
-        return web.json_response({"ok": True})
-
-    web_app = web.Application()
-    web_app.router.add_get("/", health)
-    web_app.router.add_get("/health", health)
-    web_app.router.add_get("/ping", health)
-    web_app.router.add_route("*", WEBHOOK_PATH, telegram_webhook)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    logger.info("Bot iniciado em webhook.")
-    logger.info("Render URL: %s", WEBHOOK_URL)
-    logger.info("Webhook Telegram: %s", full_webhook_url)
-    logger.info("Ping/cron: %s%s", WEBHOOK_URL, WEBHOOK_PATH)
-    logger.info("Porta: %s", PORT)
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await application.bot.delete_webhook(drop_pending_updates=False)
-        await application.stop()
-        await application.shutdown()
-        await runner.cleanup()
-
-
-def main():
     if RUN_MODE == "webhook":
-        asyncio.run(run_webhook_server())
+        if not WEBHOOK_URL:
+            raise RuntimeError("WEBHOOK_URL é obrigatório quando RUN_MODE=webhook.")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=f"{WEBHOOK_URL}/{WEBHOOK_PATH}",
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+        )
     else:
-        main_polling()
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":

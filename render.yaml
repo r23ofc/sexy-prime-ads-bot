@@ -14,29 +14,21 @@ services:
         sync: false
       - key: AGENCY_NAME
         value: Sexy Prime
-      - key: SUPPORT_URL
-        value: https://t.me/SXP_suporte
-      - key: TIMEZONE
-        value: America/Sao_Paulo
+      - key: SITE_API_URL
+        value: https://sxyprime.com/api/bot_ads_gateway.php
+      - key: SITE_API_SECRET
+        sync: false
+      - key: SITE_PANEL_URL
+        value: https://sxyprime.com/editar_perfil_modelo.php#telegram-bot-ads
+      - key: SITE_ADMIN_URL
+        value: https://sxyprime.com/admin/bot_ads.php
       - key: DB_PATH
-        value: data/sexy_prime_ads.db
+        value: data/sexy_prime_ads_runtime.db
+      - key: JOB_INTERVAL_SECONDS
+        value: 30
       - key: WEBHOOK_URL
         sync: false
       - key: WEBHOOK_PATH
         sync: false
-      - key: NOTIFY_INTERVAL_POSTS
-        value: false
-      - key: NOTIFY_SCHEDULED_POSTS
-        value: true
-
-  # Opcional: Cron Job do próprio Render para pingar o bot.
-  # Atenção: segundo a documentação do Render, Cron Jobs têm cobrança mínima mensal.
-  - type: cron
-    name: sexy-prime-ads-ping
-    runtime: python
-    schedule: "*/10 * * * *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python ping.py
-    envVars:
-      - key: PING_URL
+      - key: WEBHOOK_SECRET
         sync: false
