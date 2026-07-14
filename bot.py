@@ -198,8 +198,8 @@ def linked_keyboard(is_owner: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def unlinked_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Vincular no painel", url=SITE_PANEL_URL)]])
+def unlinked_keyboard() -> None:
+    return None
 
 
 async def profile_for(user_id: int) -> dict[str, Any] | None:
@@ -225,7 +225,7 @@ async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE, notice: 
         return
 
     if not result.get("linked"):
-        await target.reply_text(UNLINKED_MESSAGE, reply_markup=unlinked_keyboard())
+        await target.reply_text(UNLINKED_MESSAGE)
         return
 
     model = result.get("model") or {}
@@ -295,7 +295,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     profile = await profile_for(update.effective_user.id)
     if not profile or not profile.get("linked"):
-        await query.message.reply_text(UNLINKED_MESSAGE, reply_markup=unlinked_keyboard())
+        await query.message.reply_text(UNLINKED_MESSAGE)
         return
 
     if data == "ads:balance":
