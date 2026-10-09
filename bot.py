@@ -585,52 +585,80 @@ async def confirm_submission(message, context: ContextTypes.DEFAULT_TYPE, telegr
                 pass
 
 
-async def register_chat(chat, bot) -> None:
-    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}:
-        return
+def registration_db():
+    conn=sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory=sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS pending_destinations (chat_id INTEGER PRIMARY KEY, version TEXT NOT NULL)")
+    conn.commit()
+    return conn
+
+
+def queue_destination(chat_id):
+    version=secrets.token_hex(12)
+    with registration_db() as conn:
+        conn.execute("INSERT INTO pending_destinations VALUES (?,?) ON CONFLICT(chat_id) DO UPDATE SET version=excluded.version", (chat_id,version))
+    return version
+
+
+async def deliver_registration(chat_id, version, bot):
     try:
-        me = await bot.get_chat_member(chat.id, bot.id)
-        can_pin = bool(
-            getattr(me, "can_pin_messages", False)
-            or getattr(me, "can_manage_chat", False)
-            or getattr(me, "can_edit_messages", False)
-        )
-        await api_request(
-            "register_destination",
-            {
-                "chat_id": chat.id,
-                "title": chat.title or str(chat.id),
-                "type": chat.type,
-                "username": chat.username or "",
-                "can_pin": can_pin,
-            },
-        )
-        logger.info("Destino registrado: %s (%s)", chat.title, chat.id)
-    except Exception as exc:
-        logger.warning("Falha ao registrar destino %s: %s", chat.id, exc)
+        chat=await bot.get_chat(chat_id)
+        me=await bot.get_chat_member(chat_id,bot.id)
+        if me.status not in {ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER}:
+            with registration_db() as conn:
+                conn.execute("DELETE FROM pending_destinations WHERE chat_id=? AND version=?",(chat_id,version))
+            return False
+        # Membros normais de grupos também entram na fila do painel.
+        can_pin=bool(getattr(me,'can_pin_messages',False) or
+                     (chat.type==ChatType.CHANNEL and getattr(me,'can_edit_messages',False)))
+        await api_request('register_destination', {'chat_id':chat.id,'title':chat.title or str(chat.id),
+                          'type':chat.type,'username':chat.username or '', 'can_pin':can_pin})
+        with registration_db() as conn:
+            conn.execute("DELETE FROM pending_destinations WHERE chat_id=? AND version=?",(chat_id,version))
+        logger.info("Cadastro de destino confirmado pelo site: %s",chat_id)
+        return True
+    except Exception:
+        logger.exception("Cadastro do destino %s pendente; haverá nova tentativa",chat_id)
+        return False
+
+
+async def register_chat(chat, bot):
+    if chat.type not in {ChatType.GROUP,ChatType.SUPERGROUP,ChatType.CHANNEL}:
+        return False
+    version=queue_destination(chat.id)
+    return await deliver_registration(chat.id,version,bot)
+
+
+async def retry_destinations(context):
+    with registration_db() as conn:
+        rows=conn.execute("SELECT * FROM pending_destinations LIMIT 20").fetchall()
+    for row in rows:
+        await deliver_registration(row['chat_id'],row['version'],context.bot)
 
 
 async def registrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}:
-        await update.effective_message.reply_text("Use este comando no grupo ou canal que será cadastrado.")
+        await update.effective_message.reply_text("Use /registrar@SexyAds_bot no grupo que será cadastrado.")
         return
-    await register_chat(update.effective_chat, context.bot)
+    ok=await register_chat(update.effective_chat, context.bot)
     try:
-        await update.effective_message.reply_text("Destino enviado para aprovação no painel administrativo.")
+        await update.effective_message.reply_text(
+            "Cadastro confirmado pelo site. Consulte Grupos e canais no painel administrativo."
+            if ok else "O site ainda não confirmou o cadastro. O bot tentará novamente automaticamente.")
     except TelegramError:
         pass
 
 
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    changed = update.my_chat_member
+    changed=update.my_chat_member
     if not changed:
         return
-    old_status = changed.old_chat_member.status
-    new_status = changed.new_chat_member.status
-    active = new_status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
-    was_active = old_status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
-    if active and not was_active:
-        await register_chat(changed.chat, context.bot)
+    if changed.new_chat_member.status in {ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER}:
+        # Inclui promoção a administrador e alterações de permissões.
+        await register_chat(changed.chat,context.bot)
+    else:
+        with registration_db() as conn:
+            conn.execute("DELETE FROM pending_destinations WHERE chat_id=?",(changed.chat.id,))
 
 
 def destination_keyboard(buttons: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
@@ -765,6 +793,7 @@ def build_application() -> Application:
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.TEXT) & ~filters.COMMAND, private_message_handler))
     app.add_error_handler(error_handler)
+    app.job_queue.run_repeating(retry_destinations, interval=30, first=5, name="retry-destinations")
     app.job_queue.run_repeating(job_worker, interval=JOB_INTERVAL_SECONDS, first=10, name="bot-ads-worker")
     return app
 
